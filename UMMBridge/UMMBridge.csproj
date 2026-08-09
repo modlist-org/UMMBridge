@@ -1,15 +1,16 @@
-<?xml version="1.0" encoding="utf-8"?>
-<Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
-  <Import Project="$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props" Condition="Exists('$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props')" />
+<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
-    <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
-    <ProjectGuid>{285D8437-6A8E-4ABE-AB99-9936852430F8}</ProjectGuid>
     <OutputType>Library</OutputType>
-    <AppDesignerFolder>Properties</AppDesignerFolder>
     <RootNamespace>UMMBridge</RootNamespace>
     <AssemblyName>UMMBridge</AssemblyName>
-    <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <GameDir>/home/square3ang/.local/share/Steam/steamapps/common/A Dance of Fire and Ice/ADanceOfFireAndIce_Data/</GameDir>
+    <GameRootDir>$(GameDir)../</GameRootDir>
+    <MelonLoaderTarget>net35</MelonLoaderTarget>
+    <UnityAssembliesDir Condition="Exists('$(GameDir)Managed/UnityEngine.CoreModule.dll')">$(GameDir)Managed/</UnityAssembliesDir>
+    <UnityAssembliesDir Condition="'$(UnityAssembliesDir)' == ''">/home/square3ang/Documents/ADOFAIDecompiled/WithShaders/AuxiliaryFiles/GameAssemblies/</UnityAssembliesDir>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <FileAlignment>512</FileAlignment>
     <Deterministic>true</Deterministic>
     <LangVersion>12</LangVersion>
@@ -35,7 +36,7 @@
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Deploy|AnyCPU' ">
     <Optimize>true</Optimize>
-    <OutputPath>D:\Program Files\Steam\steamapps\common\A Dance of Fire and Ice\Plugins\</OutputPath>
+    <OutputPath>$(GameRootDir)Plugins/</OutputPath>
     <DefineConstants>TRACE</DefineConstants>
     <ErrorReport>prompt</ErrorReport>
     <WarningLevel>4</WarningLevel>
@@ -43,39 +44,37 @@
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="MelonLoader">
-      <HintPath>..\..\..\Program Files\Steam\steamapps\common\A Dance of Fire and Ice\MelonLoader\net472\MelonLoader.dll</HintPath>
+      <HintPath>$(GameRootDir)MelonLoader/$(MelonLoaderTarget)/MelonLoader.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="0Harmony">
-      <HintPath>..\..\..\Program Files\Steam\steamapps\common\A Dance of Fire and Ice\MelonLoader\net472\0Harmony.dll</HintPath>
+      <HintPath>$(GameRootDir)MelonLoader/$(MelonLoaderTarget)/0Harmony.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="UnityEngine.CoreModule">
-      <HintPath>..\..\..\Program Files\Steam\steamapps\common\A Dance of Fire and Ice\A Dance of Fire and Ice_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
+      <HintPath>$(UnityAssembliesDir)UnityEngine.CoreModule.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="UnityEngine.IMGUIModule">
-      <HintPath>..\..\..\Program Files\Steam\steamapps\common\A Dance of Fire and Ice\A Dance of Fire and Ice_Data\Managed\UnityEngine.IMGUIModule.dll</HintPath>
+      <HintPath>$(UnityAssembliesDir)UnityEngine.IMGUIModule.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="UnityEngine.TextRenderingModule">
-      <HintPath>..\..\..\Program Files\Steam\steamapps\common\A Dance of Fire and Ice\A Dance of Fire and Ice_Data\Managed\UnityEngine.TextRenderingModule.dll</HintPath>
+      <HintPath>$(UnityAssembliesDir)UnityEngine.TextRenderingModule.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="UnityModManager">
-      <HintPath>..\..\..\Program Files\Steam\steamapps\common\A Dance of Fire and Ice\A Dance of Fire and Ice_Data\Managed\UnityModManager\UnityModManager.dll</HintPath>
+      <HintPath>$(GameDir)Managed/UnityModManager/UnityModManager.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="Mono.Cecil">
-      <HintPath>..\..\..\Program Files\Steam\steamapps\common\A Dance of Fire and Ice\MelonLoader\net472\Mono.Cecil.dll</HintPath>
+      <HintPath>$(GameRootDir)MelonLoader/$(MelonLoaderTarget)/Mono.Cecil.dll</HintPath>
       <Private>False</Private>
     </Reference>
     <Reference Include="Mono.Cecil.Rocks">
-      <HintPath>..\..\..\Program Files\Steam\steamapps\common\A Dance of Fire and Ice\MelonLoader\net472\Mono.Cecil.Rocks.dll</HintPath>
+      <HintPath>$(GameRootDir)MelonLoader/$(MelonLoaderTarget)/Mono.Cecil.Rocks.dll</HintPath>
       <Private>False</Private>
     </Reference>
-    <Reference Include="System" />
-    <Reference Include="System.Core" />
   </ItemGroup>
   <ItemGroup>
     <Compile Include="AssemblyInterceptor.cs" />
@@ -84,5 +83,4 @@
     <Compile Include="Bridge.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>
-  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
 </Project>
