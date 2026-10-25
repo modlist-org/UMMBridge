@@ -49,18 +49,23 @@ namespace UMMBridge
                     harmonyRef.PublicKeyToken = Array.Empty<byte>();
                     modified = true;
 
-                    // Assembly-level transpiler check: if the assembly has ANY
-                    // transpiler, keep Harmony.Patch() calls native — don't
-                    // rewrite them (avoids accidentally flagging methods in
-                    // PatchedMethods via ProxyPatch).
-                    // The CreateClassProcessor/PatchAll path still does
-                    // per-method routing at UpdateWrapper (RouteConflict-
-                    // UpdateWrapper) for non-transpiler methods.
-                    if (!ModUsesTranspiler(asmDef))
+                    // Assembly-level transpiler check.  With the transpiler
+                    // bridge enabled, Patch() calls stay rewritten even for
+                    // assemblies that contain transpilers: ProxyPatch converts
+                    // each transpiler to HarmonyX instead of letting it claim a
+                    // second native detour.  Only a disabled bridge keeps such
+                    // assemblies on the native runtime.
+                    var bridgeTranspilers = TranspilerBridge.Enabled;
+                    var hasTranspiler = ModUsesTranspiler(asmDef);
+                    if (bridgeTranspilers || !hasTranspiler)
                     {
-                        modified |= RewriteHarmonyPatchCalls(asmDef);
+                        var rewrittenPatchCalls = RewriteHarmonyPatchCalls(asmDef);
+                        modified |= rewrittenPatchCalls;
                         Melon<Bridge>.Logger.Msg(
-                            $"{Path.GetFileName(filePath)} → ProxyPatch");
+                            $"{Path.GetFileName(filePath)} → " +
+                            (rewrittenPatchCalls
+                                ? "ProxyPatch" + (bridgeTranspilers && hasTranspiler ? " (transpilers bridged)" : "")
+                                : "0Harmony_UMM (no Patch() calls rewritten)"));
                     }
                     else
                     {

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -23,36 +24,68 @@ public class Bridge : MelonPlugin
     internal static readonly ConcurrentDictionary<MethodBase, bool> PatchedMethods = new();
 
     /// <summary>
-    /// Methods checked via HarmonyX.GetPatchInfo and confirmed clean
-    /// (no HarmonyX patches exist).  Avoids repeated dictionary-lock
-    /// lookups for methods never touched by MelonLoader mods.
+    /// Extra routing diagnostics.  Off by default: the conflict check runs for
+    /// every patch job, and one message per job floods the MelonLoader log.
+    /// Enable with the UMMBRIDGE_VERBOSE=1 environment variable.
     /// </summary>
-    internal static readonly ConcurrentDictionary<MethodBase, byte> ConflictCheckClean = new();
+    internal static readonly bool Verbose =
+        Environment.GetEnvironmentVariable("UMMBRIDGE_VERBOSE") == "1";
+
+    internal static void Trace(string message)
+    {
+        if (Verbose) Melon<Bridge>.Logger.Msg("[DBG] " + message);
+    }
+
+    internal static string Describe(MethodBase method)
+        => method == null ? "<null>" : $"{method.DeclaringType?.Name}.{method.Name}";
 
     /// <summary>
-    /// Called from the Cecil-injected prefix in 0Harmony_UMM's
-    /// Harmony.Patch().  Returns true if the method was already
-    /// patched by HarmonyX (via ProxyPatch or any ML mod) →
-    /// 0Harmony_UMM should skip and not create a conflicting
-    /// native detour.
+    /// Records which runtime owns the method entry.  This marker is the only
+    /// input to the conflict decision, so every state change goes through here.
+    /// </summary>
+    internal static void SetOwnership(MethodBase original, bool native)
+    {
+        PatchedMethods[original] = native;
+        Trace($"own {Describe(original)}=(native:{native})");
+    }
+
+    /// <summary>
+    /// Called from the Cecil-injected check in 0Harmony_UMM's
+    /// PatchFunctions.UpdateWrapper().  Returns true when the patch must not
+    /// claim a native detour — either because HarmonyX already owns the method
+    /// entry, or because bridge mode routes mod patches there.
     /// </summary>
     public static bool IsMethodPatchedByProxy(MethodBase original)
     {
-        // 1) Check our own ProxyPatch tracking
-        if (PatchedMethods.TryGetValue(original, out var fromProxy))
+        if (original == null) return false;
+
+        // One stack walk answers both "is this a UMM mod?" and "which one?".
+        // Walking the stack per log line was the hottest part of this check.
+        var caller = GetCaller();
+
+        // 0) Bridge mode: a mod patch belongs on HarmonyX whether or not a
+        //    conflict exists, so a transpiler can be converted instead of
+        //    claiming a second native detour.  Native ownership still wins.
+        if (TranspilerBridge.Enabled && !IsNativeOwned(original) && caller.IsMod)
         {
-            Melon<Bridge>.Logger.Msg(
-                $"ConflictCheck: \"{original.DeclaringType?.Name}.{original.Name}\" is tracked (fromProxy={fromProxy}) — [{GetCallingModName()}]");
-            return !fromProxy;
+            Trace($"bridged {Describe(original)} to HarmonyX (caller=[{caller.Name}])");
+            return true;
         }
 
-        // 1b) Fast negative cache — already checked HarmonyX, no patches found
-        if (ConflictCheckClean.ContainsKey(original))
-            return false;
+        // 1) Ownership already known
+        if (PatchedMethods.TryGetValue(original, out var nativeOwned))
+        {
+            Trace($"tracked {Describe(original)} native={nativeOwned} (caller=[{caller.Name}])");
+            return !nativeOwned;
+        }
 
-        // 2) Check HarmonyX's global patch info — catches ML mods
-        //    (RemovePaused) that patch methods via direct HarmonyX
-        //    calls, not through ProxyPatch.
+        // 2) Ask HarmonyX — this catches MelonLoader mods that patch directly
+        //    instead of going through ProxyPatch.
+        //
+        //    Deliberately NOT cached: any assembly may add a patch at any
+        //    time, so a "clean" answer is only valid for the instant it was
+        //    taken.  Reusing an old one let a native detour be written on top
+        //    of a HarmonyX detour, which corrupts the method entry.
         try
         {
             var info = HarmonyLib.Harmony.GetPatchInfo(original);
@@ -62,104 +95,263 @@ public class Bridge : MelonPlugin
                  info.Transpilers?.Count > 0 ||
                  info.Finalizers?.Count > 0))
             {
-                Melon<Bridge>.Logger.Msg(
-                    $"ConflictCheck: \"{original.DeclaringType?.Name}.{original.Name}\" has HarmonyX patches — skip native detour (caller=[{GetCallingModName()}])");
-                    Melon<Bridge>.Logger.Msg($"[DBG] PatchedMethods SET {original.DeclaringType?.Name}.{original.Name}=false (source=GetPatchInfo hit)");
-                PatchedMethods[original] = false;
+                Trace($"HarmonyX owns {Describe(original)} — skip native detour (caller=[{caller.Name}])");
+                SetOwnership(original, false);
                 return true;
             }
         }
         catch (Exception ex)
         {
+            // Cannot tell whether a detour exists, so refuse to add a second one.
             Melon<Bridge>.Logger.Warning(
-                $"ConflictCheck: GetPatchInfo failed for \"{original.DeclaringType?.Name}.{original.Name}\": {ex.Message}");
+                $"ConflictCheck: GetPatchInfo failed for \"{Describe(original)}\": {ex.Message} — " +
+                "assuming HarmonyX owns the method entry");
+            return true;
         }
 
-        // 3) No HarmonyX patches — cache negative result for fast path
-        ConflictCheckClean[original] = 0;
-
-        Melon<Bridge>.Logger.Msg(
-            $"ConflictCheck: \"{original.DeclaringType?.Name}.{original.Name}\" — no conflict, proceed (caller=[{GetCallingModName()}])");
+        Trace($"no conflict for {Describe(original)} (caller=[{caller.Name}])");
         return false;
     }
 
-    /// <summary>
-    /// Walks the call stack to identify which UMM mod triggered
-    /// the conflict check.  Skips internal frames (0Harmony_UMM,
-    /// UMMBridge) and returns the first mod assembly name found.
-    /// </summary>
-    internal static string GetCallingModName()
+    /// <summary>Nearest stack frame outside the bridge: who is patching.</summary>
+    private readonly struct Caller
+    {
+        public readonly bool IsMod;
+        public readonly string Name;
+
+        public Caller(bool isMod, string name)
+        {
+            IsMod = isMod;
+            Name = name;
+        }
+    }
+
+    private static Caller GetCaller()
     {
         try
         {
             var stack = new StackTrace(false);
             for (var i = 0; i < stack.FrameCount; i++)
             {
-                var asm = stack.GetFrame(i)?.GetMethod()?.DeclaringType?.Assembly;
-                if (asm == null) continue;
-                var name = asm.GetName().Name;
-                if (name != "0Harmony_UMM" && name != "UMMBridge")
-                    return name;
+                var assembly = stack.GetFrame(i)?.GetMethod()?.DeclaringType?.Assembly;
+                if (assembly == null) continue;
+
+                var name = assembly.GetName().Name;
+                if (name == "0Harmony_UMM" || name == "0Harmony" || name == "UMMBridge")
+                    continue;
+
+                return new Caller(AssemblyInterceptor.IsRegisteredModAssembly(assembly), name);
             }
         }
         catch { }
-        return "?";
+
+        return new Caller(false, "?");
     }
+
+    /// <summary>
+    /// True when the nearest non-internal frame comes from an assembly that
+    /// was loaded out of UMMMods.  Used to keep the transpiler bridge
+    /// scoped to mods: UMM's own core patches keep the native runtime.
+    /// </summary>
+    internal static bool IsUmmModCaller() => GetCaller().IsMod;
+
+    /// <summary>Name of the assembly that triggered the conflict check.</summary>
+    internal static string GetCallingModName() => GetCaller().Name;
 
     /// <summary>
     /// Called from the Cecil-injected check in PatchFunctions.UpdateWrapper()
     /// when IsMethodPatchedByProxy already returned true (conflict detected).
-    /// Routes non-transpiler patches through HarmonyX so both runtimes'
-    /// patches coexist.  For methods with transpilers, returns original
-    /// (skip detour — calling convention mismatch).
+    /// Applies the queued patch through HarmonyX so both runtimes' patches
+    /// coexist on a single detour.  A transpiler is converted by
+    /// <see cref="TranspilerBridge"/>; it never needs the native runtime.
     /// </summary>
     public static MethodInfo RouteConflictUpdateWrapper(MethodBase original, object patchInfoObj)
     {
-        // Check for transpilers — Harmony 2.3.6 calling convention is
-        // incompatible with HarmonyX's, so we can't proxy transpilers.
+        if (original == null || patchInfoObj == null)
+            return original as MethodInfo;
+
         try
         {
             var piType = patchInfoObj.GetType();
-            var transpilers = piType.GetField("transpilers")?.GetValue(patchInfoObj) as Array;
-            if (transpilers != null && transpilers.Length > 0)
+
+            var prefixes = FieldOf(piType, "prefixes")?.GetValue(patchInfoObj) as Array;
+            var postfixes = FieldOf(piType, "postfixes")?.GetValue(patchInfoObj) as Array;
+            var transpilers = FieldOf(piType, "transpilers")?.GetValue(patchInfoObj) as Array;
+            var finalizers = FieldOf(piType, "finalizers")?.GetValue(patchInfoObj) as Array;
+
+            // A HarmonyLib.PatchInfo we cannot read means the injected call is
+            // passing the wrong object (0Harmony_UMM changed its signature).
+            // Applying an empty patch set would silently disable the mod, so say
+            // exactly what went wrong and leave the method alone.
+            if (prefixes == null && postfixes == null && transpilers == null && finalizers == null)
             {
-                Melon<Bridge>.Logger.Msg(
-                    $"ConflictCheck: \"{original.DeclaringType?.Name}.{original.Name}\" has transpilers — skip native detour");
-                return (MethodInfo)original;
+                Melon<Bridge>.Logger.Warning(
+                    $"RouteUpdateWrapper: no patch lists on '{piType.FullName}' while routing " +
+                    $"\"{Describe(original)}\" — the mod's patch was NOT applied");
+                return original as MethodInfo;
             }
 
-            // No transpilers — apply through HarmonyX
-            Melon<Bridge>.Logger.Msg(
-                $"ConflictCheck: \"{original.DeclaringType?.Name}.{original.Name}\" — routing to HarmonyX");
+            // A transpiler can only live on HarmonyX when the bridge is on: the
+            // native calling convention cannot execute a HarmonyX-typed
+            // transpiler, and two detours cannot share a method entry.
+            if (transpilers is { Length: > 0 } && !TranspilerBridge.Enabled)
+            {
+                Melon<Bridge>.Logger.Warning(
+                    $"RouteUpdateWrapper: \"{Describe(original)}\" needs the transpiler bridge, " +
+                    "which is disabled — the mod's patch was NOT applied (enable TranspilerBridge)");
+                return original as MethodInfo;
+            }
+
+            Trace($"routing {Describe(original)} to HarmonyX");
 
             var hx = new HarmonyLib.Harmony(
                 "UMMBridge.Route." + original.DeclaringType?.Name + "." + original.Name);
             var proc = hx.CreateProcessor(original);
 
-            var prefixes = piType.GetField("prefixes")?.GetValue(patchInfoObj) as Array;
-            if (prefixes != null)
-                foreach (var p in prefixes) proc.AddPrefix(PatchToHx(p));
+            // Fetch HarmonyX's registry once instead of once per patch: a mod can
+            // register dozens of patches on one method.
+            Patches existing;
+            try { existing = HarmonyLib.Harmony.GetPatchInfo(original); }
+            catch { existing = null; }
 
-            var postfixes = piType.GetField("postfixes")?.GetValue(patchInfoObj) as Array;
-            if (postfixes != null)
-                foreach (var p in postfixes) proc.AddPostfix(PatchToHx(p));
+            bool IsOnHarmonyX(HarmonyLib.HarmonyMethod hm)
+            {
+                var method = PatchMethodOf(hm);
+                if (method == null || existing == null) return false;
 
-            var finalizers = piType.GetField("finalizers")?.GetValue(patchInfoObj) as Array;
-            if (finalizers != null)
-                foreach (var p in finalizers) proc.AddFinalizer(PatchToHx(p));
+                return (existing.Prefixes?.Any(p => p.PatchMethod == method) ?? false)
+                    || (existing.Postfixes?.Any(p => p.PatchMethod == method) ?? false)
+                    || (existing.Transpilers?.Any(p => p.PatchMethod == method) ?? false)
+                    || (existing.Finalizers?.Any(p => p.PatchMethod == method) ?? false);
+            }
+
+            var skipped = 0;
+            var added = 0;
+            var index = 0;
+
+            void Add(Array patches, Action<HarmonyLib.HarmonyMethod> add, string kind)
+            {
+                if (patches == null) return;
+
+                foreach (var patch in patches)
+                {
+                    index++;
+
+                    var hm = PatchToHx(patch);
+                    if (hm == null)
+                    {
+                        skipped++;
+                        Melon<Bridge>.Logger.Warning(
+                            $"RouteUpdateWrapper: could not read the {kind} patch of " +
+                            $"\"{Describe(original)}\" — that patch was NOT applied");
+                        continue;
+                    }
+
+                    if (IsOnHarmonyX(hm)) continue;
+                    add(hm);
+                    added++;
+                }
+            }
+
+            Add(prefixes, hm => proc.AddPrefix(hm), "prefix");
+            Add(postfixes, hm => proc.AddPostfix(hm), "postfix");
+            Add(finalizers, hm => proc.AddFinalizer(hm), "finalizer");
+
+            if (transpilers is { Length: > 0 })
+            {
+                foreach (var patch in transpilers)
+                {
+                    index++;
+
+                    var hm = PatchToHx(patch);
+                    if (hm == null)
+                    {
+                        skipped++;
+                        Melon<Bridge>.Logger.Warning(
+                            $"RouteUpdateWrapper: could not read a transpiler of \"{Describe(original)}\" — " +
+                            "the mod's transpiler was NOT applied");
+                        continue;
+                    }
+
+                    if (!TranspilerBridge.TryWrap(hm, out var wrapped, out var error))
+                    {
+                        // Keep going: dropping the prefixes/postfixes as well would
+                        // turn one unbridgeable transpiler into a completely dead
+                        // mod patch.  The warning above names the consequence.
+                        skipped++;
+                        Melon<Bridge>.Logger.Warning(
+                            $"RouteUpdateWrapper: transpiler '{PatchMethodOf(hm)?.Name}' of " +
+                            $"\"{Describe(original)}\" could not be bridged ({error}) — " +
+                            "that transpiler did NOT run");
+                        continue;
+                    }
+
+                    if (IsOnHarmonyX(wrapped)) continue;
+                    proc.AddTranspiler(wrapped);
+                    added++;
+                }
+            }
+
+            if (added == 0)
+            {
+                // Nothing new to install: every patch is either already on
+                // HarmonyX or could not be converted.  Patching with an empty
+                // processor would create a detour for no reason.
+                if (skipped > 0)
+                    Melon<Bridge>.Logger.Warning(
+                        $"RouteUpdateWrapper: none of the {index} patch(es) for \"{Describe(original)}\" " +
+                        "could be applied — the mod's patch is inactive");
+                else
+                    Trace($"{Describe(original)}: patches already on HarmonyX, nothing to add");
+
+                return original as MethodInfo;
+            }
 
             var result = proc.Patch();
-                    Melon<Bridge>.Logger.Msg($"[DBG] PatchedMethods SET {original.DeclaringType?.Name}.{original.Name}=false (source=RouteConflict)");
-            PatchedMethods[original] = false;
+            if (result == null)
+            {
+                Melon<Bridge>.Logger.Warning(
+                    $"RouteUpdateWrapper: HarmonyX returned no replacement for \"{Describe(original)}\"");
+                return original as MethodInfo;
+            }
+
+            SetOwnership(original, false);
             return result;
         }
         catch (Exception ex)
         {
             Melon<Bridge>.Logger.Warning(
-                $"RouteUpdateWrapper failed for \"{original.DeclaringType?.Name}.{original.Name}\": {ex.Message}");
-            return (MethodInfo)original;
+                $"RouteUpdateWrapper failed for \"{Describe(original)}\": {ex.GetType().Name}: {ex.Message}");
+            return original as MethodInfo;
         }
     }
+
+    /// <summary>
+    /// Field/property lookups into 0Harmony_UMM are cached per (type, name).
+    /// Patch application used to re-resolve the same handful of members for
+    /// every patch on every call; caching also lets a renamed member be
+    /// reported once at startup instead of silently reading null forever.
+    /// </summary>
+    private static readonly ConcurrentDictionary<(Type Type, string Name), FieldInfo> FieldCache = new();
+    private static readonly ConcurrentDictionary<(Type Type, string Name), PropertyInfo> PropertyCache = new();
+
+    private static FieldInfo FieldOf(Type type, string name)
+        => type == null
+            ? null
+            : FieldCache.GetOrAdd((type, name), key => key.Type.GetField(
+                key.Name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic));
+
+    private static PropertyInfo PropertyOf(Type type, string name)
+        => type == null
+            ? null
+            : PropertyCache.GetOrAdd((type, name), key => key.Type.GetProperty(
+                key.Name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic));
+
+    private static object Read(object instance, string name)
+        => instance == null ? null : FieldOf(instance.GetType(), name)?.GetValue(instance);
+
+    private static MethodInfo PatchMethodOf(HarmonyLib.HarmonyMethod hm)
+        => hm == null ? null : FieldOf(hm.GetType(), "method")?.GetValue(hm) as MethodInfo;
 
     /// <summary>
     /// Converts a 0Harmony_UMM Patch object (reflection, cross-assembly) to a
@@ -170,174 +362,151 @@ public class Bridge : MelonPlugin
         if (patch == null) return null;
         var srcType = patch.GetType();
 
-        var mi = srcType.GetProperty("PatchMethod")?.GetValue(patch, null) as MethodInfo;
+        // Harmony 2.3.x exposes the patched method as a property; some builds
+        // only carry the backing field, so accept either.
+        var mi = (PropertyOf(srcType, "PatchMethod")?.GetValue(patch, null)
+                  ?? FieldOf(srcType, "patchMethod")?.GetValue(patch)) as MethodInfo;
         if (mi == null) return null;
 
         var hx = new HarmonyLib.HarmonyMethod(mi);
-
-        var p = srcType.GetField("priority")?.GetValue(patch);
-        if (p is int _) typeof(HarmonyLib.HarmonyMethod).GetField("priority")?.SetValue(hx, p);
-
-        var d = srcType.GetField("debug")?.GetValue(patch);
-        if (d is bool _) typeof(HarmonyLib.HarmonyMethod).GetField("debug")?.SetValue(hx, d);
-
-        var bf = srcType.GetField("before")?.GetValue(patch);
-        if (bf is string[] _) typeof(HarmonyLib.HarmonyMethod).GetField("before")?.SetValue(hx, bf);
-
-        var af = srcType.GetField("after")?.GetValue(patch);
-        if (af is string[] _) typeof(HarmonyLib.HarmonyMethod).GetField("after")?.SetValue(hx, af);
-
+        CopySchedulingFields(patch, hx);
         return hx;
     }
 
     /// <summary>
-    /// HarmonyX prefix on 0Harmony_UMM's Harmony.Patch().
-    /// When a transpiler call is detected, tries to migrate any
-    /// ProxyPatch-created patches from HarmonyX to 0Harmony_UMM
-    /// so both UMM mods coexist on the same method.
+    /// Copies priority/debug/before/after from a 0Harmony_UMM patch descriptor to
+    /// a HarmonyX one.  Both runtimes store these as the same CLR types, so the
+    /// values transfer as-is.
     /// </summary>
-    public static bool Prefix_UMMPatch(MethodBase original, object transpiler)
+    private static void CopySchedulingFields(object source, HarmonyLib.HarmonyMethod target)
     {
-        if (transpiler == null) return true;
+        if (source == null || target == null) return;
 
-        // Try migration (works when all HarmonyX patches are UMMBridge proxies)
-        if (TryResolveConflict(original))
-        {
-            Melon<Bridge>.Logger.Msg(
-                $"Prefix_UMMPatch: migrated \"{original.DeclaringType?.Name}.{original.Name}\"");
-            return true;
-        }
+        var type = source.GetType();
 
-        // Migration returned false.  Could be "no HarmonyX patches at all" or
-        // "non-UMM owner present".  Check which:
-        Patches info;
-        try { info = HarmonyLib.Harmony.GetPatchInfo(original); }
-        catch { return true; }
-        if (info == null) return true; // no conflict at all, let it proceed
+        if (Read(source, "priority") is int priority)
+            FieldOf(target.GetType(), "priority")?.SetValue(target, priority);
 
-        // Check ALL categories (including Transpilers) for non-UMMBridge owners
-        var all = (info.Prefixes?.ToArray() ?? Array.Empty<Patch>())
-            .Concat(info.Postfixes?.ToArray() ?? Array.Empty<Patch>())
-            .Concat(info.Transpilers?.ToArray() ?? Array.Empty<Patch>())
-            .Concat(info.Finalizers?.ToArray() ?? Array.Empty<Patch>());
-        if (all.Any(p => !p.owner.StartsWith("UMMBridge.")))
-        {
-            Melon<Bridge>.Logger.Msg(
-                $"Prefix_UMMPatch: blocked \"{original.DeclaringType?.Name}.{original.Name}\" — non-UMM owner");
-            return false;
-        }
+        if (Read(source, "debug") is bool debug)
+            FieldOf(target.GetType(), "debug")?.SetValue(target, debug);
 
-        // All UMMBridge owners but migration failed (shouldn't happen) — proceed
-        return true;
+        if (Read(source, "before") is string[] before)
+            FieldOf(target.GetType(), "before")?.SetValue(target, before);
+
+        if (Read(source, "after") is string[] after)
+            FieldOf(target.GetType(), "after")?.SetValue(target, after);
     }
 
     /// <summary>
-    /// Check whether HarmonyX has ProxyPatch-created patches (owner starts
-    /// with "UMMBridge.") for the given method.  If all owners are UMMBridge,
-    /// migrate them to 0Harmony_UMM so patches coexist in one MonoMod domain.
+    /// HarmonyX prefix on 0Harmony_UMM's Harmony.Patch().  A method entry that
+    /// HarmonyX already owns is never detoured natively, and a UMM mod patch
+    /// that carries a transpiler is bridged to HarmonyX (see
+    /// <see cref="TranspilerBridge"/>) instead of claiming a detour of its own,
+    /// so every patch for the method shares one MonoMod runtime.
     /// </summary>
-    public static bool TryResolveConflict(MethodBase original)
+    public static bool Prefix_UMMPatch(
+        MethodBase original, object prefix, object postfix, object transpiler, object finalizer)
     {
-        Patches info;
-        try { info = HarmonyLib.Harmony.GetPatchInfo(original); }
-        catch { return false; }
-        if (info == null) return false;
-
-        var all = (info.Prefixes?.ToArray() ?? Array.Empty<Patch>())
-            .Concat(info.Postfixes?.ToArray() ?? Array.Empty<Patch>())
-            .Concat(info.Transpilers?.ToArray() ?? Array.Empty<Patch>())
-            .Concat(info.Finalizers?.ToArray() ?? Array.Empty<Patch>())
-            .ToList();
-
-        if (all.Count == 0) return false;
-
-        // Transpilers can't be migrated.  If ONLY transpilers exist, bail.
-        var transpilerCount = info.Transpilers?.Count ?? 0;
-        if (all.Count == transpilerCount) return false;
-
-        var owners = all.Select(p => p.owner).Distinct().ToList();
-        if (owners.Any(o => !o.StartsWith("UMMBridge.")))
-            return false; // ML mod owns the method, can't migrate
-
-        Melon<Bridge>.Logger.Msg(
-            $"Migrating {all.Count} patch(es) from HarmonyX to 0Harmony_UMM for " +
-            $"\"{original.DeclaringType?.Name}.{original.Name}\"");
-
-        try
+        if (transpiler == null)
         {
-            MigratePatches(original, info.Prefixes?.ToArray() ?? Array.Empty<Patch>(),
-                info.Postfixes?.ToArray() ?? Array.Empty<Patch>(),
-                info.Finalizers?.ToArray() ?? Array.Empty<Patch>());
+            // The native Patch() below claims this method entry.  If HarmonyX
+            // already detoured the same prologue, letting it proceed would put
+            // two JMPs on one entry point — refuse instead of corrupting it.
+            // When 0Harmony_UMM already owns the entry there is no second JMP
+            // to create: the patch only joins the existing native table, so a
+            // HarmonyX table (possible only via an out-of-bridge patch) must
+            // not veto it.
+            if (!IsNativeOwned(original) && HasHarmonyXPatches(original))
+            {
+                Melon<Bridge>.Logger.Warning(
+                    $"Prefix_UMMPatch: HarmonyX owns \"{Describe(original)}\" — native detour skipped");
+                return false;
+            }
+
+            MarkNativeOwner(original);
+            return true;
         }
-        catch (Exception ex)
+
+        // ── Bridge path ────────────────────────────────────────────────
+        // A UMM mod's transpiler no longer has to claim a native detour:
+        // it is converted to HarmonyX and applied next to every other patch.
+        // UMM's own core patches keep the native path — except when HarmonyX
+        // already owns the method entry (a MelonLoader mod patched it through
+        // ProxyPatch), because no native detour can exist on such a method any
+        // more, so the transpiler has to be bridged instead of stacked on top.
+        //
+        // There is deliberately no "migrate back to native" fallback here:
+        // HarmonyX's ManagedMethodPatcher.DetourTo() ignores its target and
+        // re-applies the ILHook even after every patch was unpatched, so a
+        // migration would leave that detour in place and stack a second JMP on
+        // the same prologue — the exact corruption this bridge exists to avoid.
+        var harmonyXOwns = HasHarmonyXPatches(original);
+        if (TranspilerBridge.Enabled && !IsNativeOwned(original) && (IsUmmModCaller() || harmonyXOwns))
+        {
+            var bridged = ApplyToHarmonyX(original, prefix, postfix, transpiler, finalizer, out var bridgeError);
+            if (bridged != null)
+            {
+                Melon<Bridge>.Logger.Msg(
+                    $"Prefix_UMMPatch: bridged \"{original.DeclaringType?.Name}.{original.Name}\" to HarmonyX");
+                return false;
+            }
+
+            Melon<Bridge>.Logger.Warning(
+                $"Prefix_UMMPatch: bridge failed for \"{original.DeclaringType?.Name}.{original.Name}\" " +
+                $"({bridgeError}) — falling back to native");
+        }
+
+        // HarmonyX owns the method entry, so a native detour would be a second
+        // JMP on the same prologue — refuse it.  HasHarmonyXPatches() also
+        // reports "owned" when the patch table cannot be read, which is the safe
+        // answer for that case too.  If 0Harmony_UMM already owns the entry the
+        // patch merely joins the existing native table, so refusing it would
+        // drop the transpiler for no benefit.
+        if (harmonyXOwns && !IsNativeOwned(original))
         {
             Melon<Bridge>.Logger.Warning(
-                $"TryResolveConflict: migration failed for \"{original.DeclaringType?.Name}.{original.Name}\": {ex.Message}");
+                $"Prefix_UMMPatch: HarmonyX owns \"{Describe(original)}\" — native detour skipped");
             return false;
         }
+
+        MarkNativeOwner(original);
         return true;
     }
 
-    private static void MigratePatches(MethodBase original,
-        Patch[] prefixes, Patch[] postfixes, Patch[] finalizers)
+    private static void MarkNativeOwner(MethodBase original)
     {
-        try
+        // Do not overwrite an existing ProxyPatch marker: false means HarmonyX
+        // owns the detour and the native runtime must stay away from it.
+        if (!PatchedMethods.TryAdd(original, true))
         {
-            var ummHarmony = AssemblyInterceptor._ummHarmony;
-            if (ummHarmony == null) return;
-
-            var ummHarmonyType = ummHarmony.GetType("HarmonyLib.Harmony");
-            var ummHMType = ummHarmony.GetType("HarmonyLib.HarmonyMethod");
-            var newHarmony = Activator.CreateInstance(ummHarmonyType, "UMMBridge.Migrated");
-
-            var hmCtor = ummHMType.GetConstructor(new[] { typeof(MethodInfo) });
-            var patchMethod = ummHarmonyType.GetMethod("Patch", new[] {
-                typeof(MethodBase), ummHMType, ummHMType, ummHMType, ummHMType
-            });
-
-            // Remove from HarmonyX first
-            foreach (var p in prefixes.Concat(postfixes).Concat(finalizers))
-                new HarmonyLib.Harmony(p.owner).Unpatch(original, p.PatchMethod);
-
-            // Re-register on 0Harmony_UMM
-            foreach (var p in prefixes)
-            {
-                var hm = hmCtor.Invoke(new object[] { p.PatchMethod });
-                SetHmFields(hm, p.priority, p.debug, p.before, p.after);
-                patchMethod.Invoke(newHarmony, new object[] { original, hm, null, null, null });
-            }
-            foreach (var p in postfixes)
-            {
-                var hm = hmCtor.Invoke(new object[] { p.PatchMethod });
-                SetHmFields(hm, p.priority, p.debug, p.before, p.after);
-                patchMethod.Invoke(newHarmony, new object[] { original, null, hm, null, null });
-            }
-            foreach (var p in finalizers)
-            {
-                var hm = hmCtor.Invoke(new object[] { p.PatchMethod });
-                SetHmFields(hm, p.priority, p.debug, p.before, p.after);
-                patchMethod.Invoke(newHarmony, new object[] { original, null, null, null, hm });
-            }
-
-            PatchedMethods[original] = true;
-        }
-        catch (Exception ex)
-        {
-            Melon<Bridge>.Logger.Warning(
-                $"MigratePatches failed for \"{original.DeclaringType?.Name}.{original.Name}\": {ex.Message}");
-            throw;
+            Trace($"native ownership already set for {Describe(original)} (marker={(IsNativeOwned(original) ? "native" : "harmonyx")})");
         }
     }
 
     /// <summary>
     /// Reflectively invoke 0Harmony_UMM's Harmony.Patch() with the given
-    /// parameters.  Used when the method already has a native detour or
-    /// when a transpiler is present (incompatible with HarmonyX).
+    /// parameters.  Used when 0Harmony_UMM already owns the method entry,
+    /// when <see cref="TranspilerBridge"/>.Enabled is false, or as the
+    /// fallback for a transpiler that could not be converted while HarmonyX
+    /// does not own the method.
     /// </summary>
     private static MethodInfo InvokeNativePatch(
         object harmonyIgnored, MethodBase original,
         object prefix, object postfix, object transpiler, object finalizer)
     {
+        // Never add a second detour on top of a HarmonyX one; that is the
+        // corruption this whole bridge exists to prevent.  When 0Harmony_UMM
+        // already owns the entry there is no second detour to create: the
+        // patch merely joins the existing native patch table, so a HarmonyX
+        // patch table (only possible if something patched outside the bridge)
+        // must not veto it.
+        if (!IsNativeOwned(original) && HasHarmonyXPatches(original))
+        {
+            Melon<Bridge>.Logger.Warning(
+                $"InvokeNativePatch: HarmonyX owns \"{Describe(original)}\" — native patch skipped");
+            return null;
+        }
+
         try
         {
             var harmonyType = harmonyIgnored.GetType();
@@ -345,36 +514,27 @@ public class Bridge : MelonPlugin
             var nativePatch = harmonyType.GetMethod("Patch", new[] {
                 typeof(MethodBase), hmType, hmType, hmType, hmType
             });
-            if (nativePatch != null)
+            if (nativePatch == null)
             {
-                var nativeResult = (MethodInfo)nativePatch.Invoke(harmonyIgnored, new object[] {
-                    original, prefix, postfix, transpiler, finalizer
-                });
-                if (nativeResult != null)
-                {
-                    Melon<Bridge>.Logger.Msg(
-                        $"[DBG] PatchedMethods SET {original.DeclaringType?.Name}.{original.Name}=true (source=InvokeNativePatch)");
-                    PatchedMethods[original] = true;
-                }
-                return nativeResult;
+                Melon<Bridge>.Logger.Warning(
+                    $"InvokeNativePatch: 0Harmony_UMM Harmony.Patch(MethodBase, HarmonyMethod x4) not found for \"{Describe(original)}\"");
+                return null;
             }
+
+            var nativeResult = (MethodInfo)nativePatch.Invoke(harmonyIgnored, new object[] {
+                original, prefix, postfix, transpiler, finalizer
+            });
+
+            if (nativeResult != null) SetOwnership(original, true);
+            return nativeResult;
         }
         catch (Exception ex)
         {
             Melon<Bridge>.Logger.Warning(
-                $"InvokeNativePatch failed for \"{original.DeclaringType?.Name}.{original.Name}\": {ex.Message}");
+                $"InvokeNativePatch failed for \"{Describe(original)}\": {ex.Message}");
         }
-        return null;
-    }
 
-    private static void SetHmFields(object hmObj, int priority, bool debug,
-        string[] before, string[] after)
-    {
-        var t = hmObj.GetType();
-        t.GetField("priority")?.SetValue(hmObj, priority);
-        t.GetField("debug")?.SetValue(hmObj, debug);
-        t.GetField("before")?.SetValue(hmObj, before);
-        t.GetField("after")?.SetValue(hmObj, after);
+        return null;
     }
 
     private static readonly MethodInfo OriginalModsPathGetter = typeof(UnityModManager).GetProperty(nameof(UnityModManager.modsPath), BindingFlags.Public | BindingFlags.Static)?.GetGetMethod();
@@ -382,6 +542,10 @@ public class Bridge : MelonPlugin
 
     public override void OnApplicationStarted()
     {
+        TranspilerBridge.Log = message => Melon<Bridge>.Logger.Msg(message);
+        TranspilerBridge.Warn = message => Melon<Bridge>.Logger.Warning(message);
+        TranspilerBridge.Initialize();
+
         AssemblyInterceptor.Initialize();
 
         var harmony = new HarmonyLib.Harmony("UMMBridge");
@@ -451,6 +615,11 @@ public class Bridge : MelonPlugin
     // MonoBehaviour 负责 OnGUI 绘制
     private class MessageDisplay : MonoBehaviour
     {
+        // OnGUI runs every frame while a message is visible.  Building the style
+        // (and its nested GUIStyleState) per frame produced steady garbage, so
+        // it is created once on the GUI thread and reused.
+        private GUIStyle _style;
+
         private void OnGUI()
         {
             if (string.IsNullOrEmpty(_displayMessage) || Time.unscaledTime > _messageEndTime)
@@ -459,18 +628,22 @@ public class Bridge : MelonPlugin
                 return;
             }
 
-            var rect = new Rect(10, 10, Screen.width - 20, 60);
-            var style = new GUIStyle(GUI.skin.label)
+            if (_style == null)
             {
-                fontSize = 20,
-                fontStyle = FontStyle.Normal,
-                normal = { textColor = Color.white },
-                alignment = TextAnchor.UpperLeft
-            };
+                _style = new GUIStyle(GUI.skin.label)
+                {
+                    fontSize = 20,
+                    fontStyle = FontStyle.Normal,
+                    normal = { textColor = Color.white },
+                    alignment = TextAnchor.UpperLeft
+                };
+            }
+
+            var rect = new Rect(10, 10, Screen.width - 20, 60);
             // 黑色阴影
             var shadowRect = new Rect(rect.x + 1, rect.y + 1, rect.width, rect.height);
-            GUI.Label(shadowRect, _displayMessage, style);
-            GUI.Label(rect, _displayMessage, style);
+            GUI.Label(shadowRect, _displayMessage, _style);
+            GUI.Label(rect, _displayMessage, _style);
         }
     }
 
@@ -511,8 +684,11 @@ public class Bridge : MelonPlugin
     /// in UMM mod assemblies.  Per-call routing:
     ///   - transpiler == null → translate HarmonyMethod to HarmonyX and apply
     ///     through HarmonyX (single MonoMod for non-transpiler patches).
-    ///   - transpiler != null → delegate back to 0Harmony_UMM native Patch()
-    ///     (transpiler calling convention is incompatible with HarmonyX).
+    ///   - transpiler != null and the bridge is enabled → the transpiler is
+    ///     wrapped by <see cref="TranspilerBridge"/> and also applied through
+    ///     HarmonyX, so the method keeps exactly one MonoMod detour.
+    ///   - transpiler != null with the bridge disabled → 0Harmony_UMM native
+    ///     Patch(), because the two transpiler calling conventions differ.
     /// </summary>
     public static MethodInfo ProxyPatch(
         object harmonyIgnored,  // 0Harmony_UMM's Harmony instance
@@ -547,61 +723,163 @@ public class Bridge : MelonPlugin
             return InvokeNativePatch(harmonyIgnored, original, prefix, postfix, transpiler, finalizer);
         }
 
-        // ── Transpiler path ────────────────────────────────────────────
-        // Calling convention incompatible with HarmonyX — delegate to
-        // 0Harmony_UMM's native Patch() via reflection.
-        if (transpiler != null)
+        // ── HarmonyX path ──────────────────────────────────────────────
+        // Transpilers are converted by TranspilerBridge, so every patch for
+        // this method can live on HarmonyX — one MonoMod, no cross-runtime
+        // detour conflict.  Only an explicitly disabled bridge still needs
+        // the native runtime for transpilers.
+        if (transpiler != null && !TranspilerBridge.Enabled)
         {
             return InvokeNativePatch(harmonyIgnored, original, prefix, postfix, transpiler, finalizer);
         }
 
-        // ── Non-transpiler path ────────────────────────────────────────
-        // Translate to HarmonyX HarmonyMethod and apply through HarmonyX.
-        var id = "UMMBridge.Proxy." + original.DeclaringType?.Name + "." + original.Name;
-        var harmony = new HarmonyLib.Harmony(id);
-
-        HarmonyLib.HarmonyMethod ToHx(object hm)
+        var result = ApplyToHarmonyX(original, prefix, postfix, transpiler, finalizer, out var error);
+        if (result == null && transpiler != null)
         {
-            if (hm == null) return null;
-            var srcType = hm.GetType();
-            var mi = srcType.GetField("method")?.GetValue(hm) as MethodInfo;
-            if (mi == null) return null;
+            // Never write a native detour over an existing HarmonyX one: that
+            // is exactly the corruption this bridge exists to prevent.  Skip
+            // the patch (with a reason) when HarmonyX already owns the method.
+            if (HasHarmonyXPatches(original))
+            {
+                Melon<Bridge>.Logger.Warning(
+                    $"ProxyPatch: transpiler bridge failed for \"{original.DeclaringType?.Name}.{original.Name}\" " +
+                    $"({error}) and HarmonyX already owns the method — patch skipped");
+                return null;
+            }
 
-            var hx = new HarmonyLib.HarmonyMethod(mi);
-
-            // Read known fields by name.  0Harmony_UMM and HarmonyX share
-            // the same field names/CLR types for priority, before, after,
-            // debug.  Fields only in one side (beforeHard, afterHard,
-            // mergedBefore/After) are never read, avoiding cross-assembly
-            // type mismatches without needing type-level reflection checks.
-            var p = srcType.GetField("priority")?.GetValue(hm);
-            if (p is int _) typeof(HarmonyLib.HarmonyMethod).GetField("priority")?.SetValue(hx, p);
-
-            var d = srcType.GetField("debug")?.GetValue(hm);
-            if (d is bool _) typeof(HarmonyLib.HarmonyMethod).GetField("debug")?.SetValue(hx, d);
-
-            var bf = srcType.GetField("before")?.GetValue(hm);
-            if (bf is string[] _) typeof(HarmonyLib.HarmonyMethod).GetField("before")?.SetValue(hx, bf);
-
-            var af = srcType.GetField("after")?.GetValue(hm);
-            if (af is string[] _) typeof(HarmonyLib.HarmonyMethod).GetField("after")?.SetValue(hx, af);
-
-            return hx;
+            Melon<Bridge>.Logger.Warning(
+                $"ProxyPatch: transpiler bridge failed for \"{original.DeclaringType?.Name}.{original.Name}\" " +
+                $"({error}) — falling back to 0Harmony_UMM");
+            return InvokeNativePatch(harmonyIgnored, original, prefix, postfix, transpiler, finalizer);
         }
 
-        var proc = harmony.CreateProcessor(original);
-        var prefixHx = ToHx(prefix);
-        if (prefixHx != null) proc.AddPrefix(prefixHx);
-        var postfixHx = ToHx(postfix);
-        if (postfixHx != null) proc.AddPostfix(postfixHx);
-        var transpilerHx = ToHx(transpiler);
-        if (transpilerHx != null) proc.AddTranspiler(transpilerHx);
-        var finalizerHx = ToHx(finalizer);
-        if (finalizerHx != null) proc.AddFinalizer(finalizerHx);
+        if (result == null)
+        {
+            Melon<Bridge>.Logger.Warning(
+                $"ProxyPatch: HarmonyX patch failed for \"{original.DeclaringType?.Name}.{original.Name}\": {error}");
+        }
 
-        var result = proc.Patch();
-        PatchedMethods[original] = false; // track as ProxyPatch
         return result;
+    }
+
+    /// <summary>
+    /// Applies a UMM patch through HarmonyX.  A UMM transpiler is wrapped by
+    /// <see cref="TranspilerBridge"/> so it can run against HarmonyX's
+    /// CodeInstruction stream, which lets every patch for the method share a
+    /// single MonoMod runtime.  Returns null (with a reason) on failure.
+    /// </summary>
+    internal static MethodInfo ApplyToHarmonyX(
+        MethodBase original, object prefix, object postfix, object transpiler, object finalizer,
+        out string error)
+    {
+        error = null;
+
+        try
+        {
+            var id = "UMMBridge.Proxy." + original.DeclaringType?.Name + "." + original.Name;
+            var harmony = new HarmonyLib.Harmony(id);
+            var proc = harmony.CreateProcessor(original);
+
+            var prefixHx = ToHx(prefix);
+            if (prefixHx != null) proc.AddPrefix(prefixHx);
+            else if (prefix != null)
+                Melon<Bridge>.Logger.Warning(
+                    $"ProxyPatch: could not read the prefix of \"{Describe(original)}\" — it was NOT applied");
+
+            var postfixHx = ToHx(postfix);
+            if (postfixHx != null) proc.AddPostfix(postfixHx);
+            else if (postfix != null)
+                Melon<Bridge>.Logger.Warning(
+                    $"ProxyPatch: could not read the postfix of \"{Describe(original)}\" — it was NOT applied");
+
+            var finalizerHx = ToHx(finalizer);
+            if (finalizerHx != null) proc.AddFinalizer(finalizerHx);
+            else if (finalizer != null)
+                Melon<Bridge>.Logger.Warning(
+                    $"ProxyPatch: could not read the finalizer of \"{Describe(original)}\" — it was NOT applied");
+
+            if (transpiler != null)
+            {
+                var transpilerHx = ToHx(transpiler);
+                if (transpilerHx == null)
+                {
+                    error = "transpiler method could not be read";
+                    return null;
+                }
+
+                if (!TranspilerBridge.TryWrap(transpilerHx, out var wrapped, out error))
+                    return null;
+
+                proc.AddTranspiler(wrapped);
+            }
+
+            var result = proc.Patch();
+            if (result == null)
+            {
+                error = "HarmonyX returned no replacement method";
+                return null;
+            }
+
+            SetOwnership(original, false);
+            return result;
+        }
+        catch (Exception ex)
+        {
+            error = $"{ex.GetType().Name}: {ex.Message}";
+            return null;
+        }
+    }
+
+    private static bool IsNativeOwned(MethodBase original)
+        => PatchedMethods.TryGetValue(original, out var native) && native;
+
+    /// <summary>
+    /// True when HarmonyX has any patch (including a UMMBridge proxy) on the
+    /// method.  Used to refuse native fallbacks that would overwrite a
+    /// HarmonyX detour.
+    /// </summary>
+    private static bool HasHarmonyXPatches(MethodBase original)
+    {
+        if (PatchedMethods.TryGetValue(original, out var native) && !native)
+            return true;
+
+        try
+        {
+            var info = HarmonyLib.Harmony.GetPatchInfo(original);
+            if (info == null) return false;
+
+            return (info.Prefixes?.Count ?? 0) +
+                   (info.Postfixes?.Count ?? 0) +
+                   (info.Transpilers?.Count ?? 0) +
+                   (info.Finalizers?.Count ?? 0) > 0;
+        }
+        catch
+        {
+            // If the patch table cannot be read, assume a detour exists and
+            // do not risk a second one.
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Translates a 0Harmony_UMM HarmonyMethod to a HarmonyX one by reading
+    /// its fields by name.
+    /// </summary>
+    private static HarmonyLib.HarmonyMethod ToHx(object hm)
+    {
+        if (hm == null) return null;
+
+        var mi = FieldOf(hm.GetType(), "method")?.GetValue(hm) as MethodInfo;
+        if (mi == null) return null;
+
+        var hx = new HarmonyLib.HarmonyMethod(mi);
+
+        // 0Harmony_UMM and HarmonyX share the same field names/CLR types for
+        // priority, before, after and debug.  Fields that exist on only one
+        // side (beforeHard, afterHard, mergedBefore/After) are never read, so
+        // no cross-assembly type comparison is needed.
+        CopySchedulingFields(hm, hx);
+        return hx;
     }
 
     /// <summary>

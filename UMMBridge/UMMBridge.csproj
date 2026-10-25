@@ -9,6 +9,12 @@
     <MelonLoaderTarget>net35</MelonLoaderTarget>
     <UnityAssembliesDir Condition="Exists('$(GameDir)Managed/UnityEngine.CoreModule.dll')">$(GameDir)Managed/</UnityAssembliesDir>
     <UnityAssembliesDir Condition="'$(UnityAssembliesDir)' == ''">/home/square3ang/Documents/ADOFAIDecompiled/WithShaders/AuxiliaryFiles/GameAssemblies/</UnityAssembliesDir>
+    <!-- Local reference fallback.  Only used when the original HintPath is
+         missing (e.g. no game install on this machine).  Set LibsDir on the
+         command line to point somewhere else: -p:LibsDir=D:\\path\\to\\Libs/ -->
+    <LibsDir Condition="'$(LibsDir)' == ''">$(MSBuildThisFileDirectory)../Libs/</LibsDir>
+    <LibsMelonLoaderDir Condition="Exists('$(LibsDir)MelonLoader/MelonLoader/$(MelonLoaderTarget)/MelonLoader.dll')">$(LibsDir)MelonLoader/MelonLoader/$(MelonLoaderTarget)/</LibsMelonLoaderDir>
+    <LibsMelonLoaderDir Condition="'$(LibsMelonLoaderDir)' == ''">$(LibsDir)</LibsMelonLoaderDir>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <FileAlignment>512</FileAlignment>
@@ -76,11 +82,41 @@
       <Private>False</Private>
     </Reference>
   </ItemGroup>
+  <!-- Fallback reference locations.  These do not replace the HintPaths above:
+       each one only applies when the original file does not exist, so an actual
+       game install keeps using its own assemblies. -->
+  <ItemGroup>
+    <Reference Update="MelonLoader" Condition="!Exists('$(GameRootDir)MelonLoader/$(MelonLoaderTarget)/MelonLoader.dll')">
+      <HintPath>$(LibsMelonLoaderDir)MelonLoader.dll</HintPath>
+    </Reference>
+    <Reference Update="0Harmony" Condition="!Exists('$(GameRootDir)MelonLoader/$(MelonLoaderTarget)/0Harmony.dll')">
+      <HintPath>$(LibsMelonLoaderDir)0Harmony.dll</HintPath>
+    </Reference>
+    <Reference Update="Mono.Cecil" Condition="!Exists('$(GameRootDir)MelonLoader/$(MelonLoaderTarget)/Mono.Cecil.dll')">
+      <HintPath>$(LibsMelonLoaderDir)Mono.Cecil.dll</HintPath>
+    </Reference>
+    <Reference Update="Mono.Cecil.Rocks" Condition="!Exists('$(GameRootDir)MelonLoader/$(MelonLoaderTarget)/Mono.Cecil.Rocks.dll')">
+      <HintPath>$(LibsMelonLoaderDir)Mono.Cecil.Rocks.dll</HintPath>
+    </Reference>
+    <Reference Update="UnityEngine.CoreModule" Condition="!Exists('$(UnityAssembliesDir)UnityEngine.CoreModule.dll')">
+      <HintPath>$(LibsDir)UnityEngine.CoreModule.dll</HintPath>
+    </Reference>
+    <Reference Update="UnityEngine.IMGUIModule" Condition="!Exists('$(UnityAssembliesDir)UnityEngine.IMGUIModule.dll')">
+      <HintPath>$(LibsDir)UnityEngine.IMGUIModule.dll</HintPath>
+    </Reference>
+    <Reference Update="UnityEngine.TextRenderingModule" Condition="!Exists('$(UnityAssembliesDir)UnityEngine.TextRenderingModule.dll')">
+      <HintPath>$(LibsDir)UnityEngine.TextRenderingModule.dll</HintPath>
+    </Reference>
+    <Reference Update="UnityModManager" Condition="!Exists('$(GameDir)Managed/UnityModManager/UnityModManager.dll')">
+      <HintPath>$(LibsDir)UnityModManager.dll</HintPath>
+    </Reference>
+  </ItemGroup>
   <ItemGroup>
     <Compile Include="AssemblyInterceptor.cs" />
     <Compile Include="AssemblyInterceptor.Patching.cs" />
     <Compile Include="AssemblyInterceptor.Transpiler.cs" />
     <Compile Include="Bridge.cs" />
+    <Compile Include="TranspilerBridge.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>
 </Project>

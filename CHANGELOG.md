@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.0.6
+
+### 中文
+
+- **Transpiler 桥接** — 新增 `TranspilerBridge`：在 0Harmony_UMM 与 HarmonyX 的 `CodeInstruction` 之间做双向转换（opcode、operand、labels、exception blocks），把 UMM mod 的 transpiler 包装为 HarmonyX 兼容的 transpiler 并注册到同一运行时；`PatchAll`（UpdateWrapper 注入）与直接 `Patch()`（ProxyPatch）两条路径均已接入
+- **消除核心限制** — UMM mod 的 transpiler 与 MelonLoader mod 的补丁现在可以在同一方法上共存（前提是该方法未被 UMM core 补丁原生占有）；UMM mod 之间不再依赖加载顺序（全部落在 HarmonyX）
+- **不再静默丢弃** — 转换失败会记录具体原因；0Harmony_UMM 已持有入口时该补丁加入既有原生表，仅 HarmonyX 持有入口时才跳过（拒绝写入第二个 detour 破坏已有补丁）
+- **补丁去重** — UpdateWrapper 路由前检查 HarmonyX 上是否已注册同一补丁方法，避免重复执行
+- **开关** — `UMMBridge.cfg` 中 `TranspilerBridge=false` 或环境变量 `UMMBRIDGE_TRANSPILER_BRIDGE=0` 可恢复旧行为
+- **离线验证** — 使用真实 0Harmony 2.3.6 与 HarmonyX 2.10.2 验证了转换、包装、label 与 operand 往返（无游戏环境）
+- **构建** — 原有 `HintPath` 保持不变；缺少游戏目录时自动回退到仓库 `Libs/`（可用 `-p:LibsDir=...` 覆盖），`Libs/` 已忽略
+
+#### 关键修复（v0.0.6 复审）
+
+- **空方法体** — transpiler 返回 `null` 时原样回放输入指令流；返回非指令序列或元素类型不符时抛出带 transpiler 名称的异常。此前会产出空序列，HarmonyX 据此生成空方法体，被补丁的代码静默消失
+- **热路径去反射** — `CodeInstruction` 的 opcode/operand/labels/blocks 读写、指令与异常块的构造、列表分配全部改为一次性编译的委托，不再逐指令反射
+- **注入校验** — `PatchFunctions.UpdateWrapper` 的 Cecil 注入现在校验 `(MethodBase, PatchInfo)` 参数形状、`MethodInfo` 返回类型并做幂等检查；签名不符或找不到重载时明确告警，此前会静默不注入
+- **反射缓存** — 跨程序集读取 0Harmony_UMM 的成员改为按 `(类型, 名称)` 缓存；读取失败时输出“该补丁未生效”的明确告警，不再静默 continue
+- **移除永不失效的负缓存** — 冲突检查原先把“已确认无 HarmonyX 补丁”缓存到进程结束；任何 mod 之后加的补丁都会被忽略，导致原生 detour 覆盖 HarmonyX detour。现改为每次查询
+- **调用栈只走一次** — 冲突检查原先每条日志各构造一次 `StackTrace`；现在一次遍历同时得出“是否 UMM mod 调用”与调用者名，诊断日志需 `UMMBRIDGE_VERBOSE=1` 才输出
+- **移除补丁迁移** — `MigratePatches`/`TryResolveConflict` 整条路径已删除：bridge 启用时 mod transpiler 直接桥接到 HarmonyX，无需把已有的 HarmonyX 补丁搬到原生运行时；bridge 关闭时含 transpiler 的程序集保持原生。两条路径都不再存在“迁移到一半”的状态
+- **detour 唯一性** — `Prefix_UMMPatch`（含非 transpiler 分支）、`InvokeNativePatch`、`ProxyPatch` 现在都会在“HarmonyX 已持有、且 0Harmony_UMM 尚未持有该方法入口”时拒绝原生 detour，而不是覆盖它；0Harmony_UMM 已持有入口时新补丁只是加入既有原生表，不再被误拒
+- **Cecil 重写返回值** — 重写 `Harmony.Patch()` 调用时不再 `pop; ldnull`（把返回的 `MethodInfo` 变成 null），保留代理的真实返回值；参数多于 5 个的重载不再改写，避免求值栈失衡
+- **GUI** — 消息显示的 `GUIStyle` 改为缓存，消除每帧分配
+
+### English
+
+- **Transpiler bridge** — new `TranspilerBridge` converts `CodeInstruction` both ways between 0Harmony_UMM and HarmonyX (opcode, operand, labels, exception blocks) and wraps a UMM transpiler into a HarmonyX-compatible one, so it is registered on a single runtime; both `PatchAll` (UpdateWrapper injection) and direct `Patch()` (ProxyPatch) paths are covered
+- **Core limitation removed** — UMM mod transpilers can now coexist with MelonLoader mod patches on the same method (provided no UMM core patch owns the method natively); UMM mod-to-mod patches no longer depend on load order (all live on HarmonyX)
+- **No silent drops** — conversion failures log the reason; when 0Harmony_UMM already owns the entry the patch joins the existing native table, and only a method owned solely by HarmonyX is skipped (a second detour is refused instead of corrupting the existing patch)
+- **Patch deduplication** — UpdateWrapper routing checks HarmonyX for the same patch method before adding it, avoiding double execution
+- **Toggle** — `TranspilerBridge=false` in `UMMBridge.cfg`, or `UMMBRIDGE_TRANSPILER_BRIDGE=0`, restores the previous behaviour
+- **Offline verification** — conversion, wrapping, label and operand round-trips exercised against real 0Harmony 2.3.6 and HarmonyX 2.10.2 (no game install)
+- **Build** — existing `HintPath`s are untouched; missing game folders fall back to the repository's `Libs/` (override with `-p:LibsDir=...`), which is git-ignored
+
+#### Reliability fixes (v0.0.6 review)
+
+- **Empty method body** — a transpiler returning `null` now replays the incoming instruction stream, and a non-sequence/wrong-element result throws with the transpiler's name. Previously an empty sequence was returned, which HarmonyX turned into an empty method body, silently deleting the patched code
+- **No per-instruction reflection** — reading/writing `opcode`/`operand`/`labels`/`blocks`, constructing instructions and exception blocks, and allocating the lists all go through once-compiled delegates
+- **Injection validation** — the `PatchFunctions.UpdateWrapper` Cecil injection now verifies the `(MethodBase, PatchInfo)` shape, the `MethodInfo` return type, and is idempotent; a mismatch or missing overload is reported instead of silently skipping the injection
+- **Cached reflection** — 0Harmony_UMM member lookups are cached per `(type, name)`; a failed read logs an explicit "this patch was NOT applied" warning instead of `continue`-ing silently
+- **Stale cache removed** — the conflict check used to cache "verified clean" for the process lifetime, so any patch added later was ignored and a native detour could land on a HarmonyX detour. It now queries every time
+- **One stack walk** — the check used to build a `StackTrace` per log line; a single pass now yields both "is this a UMM mod?" and the caller name, and diagnostics require `UMMBRIDGE_VERBOSE=1`
+- **Patch migration removed** — the whole `MigratePatches`/`TryResolveConflict` path is deleted: with the bridge on, a mod transpiler is converted to HarmonyX and needs no move of the existing HarmonyX patches to the native runtime; with the bridge off, assemblies containing transpilers stay native. There is no longer any half-migrated state
+- **Single detour invariant** — `Prefix_UMMPatch` (including its non-transpiler branch), `InvokeNativePatch` and `ProxyPatch` now refuse a native detour when HarmonyX already owns the method and 0Harmony_UMM does not, instead of overwriting it; when 0Harmony_UMM already owns the entry a new patch only joins the existing native table instead of being wrongly refused
+- **Cecil rewrite return value** — rewriting `Harmony.Patch()` no longer emits `pop; ldnull` (turning the returned `MethodInfo` into null); overloads with more than five parameters are left alone to keep the evaluation stack balanced
+- **GUI** — the message `GUIStyle` is cached, removing a per-frame allocation
+
 ## v0.0.5
 
 ### 中文

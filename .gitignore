@@ -1,3 +1,9 @@
+## Local reference assemblies (not distributed)
+Libs/
+
+## Local tooling scratch (Freebuff Desktop metadata, agent temp files)
+.freebuff/
+
 ## .NET
 bin/
 obj/

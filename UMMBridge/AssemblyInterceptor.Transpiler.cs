@@ -1,5 +1,6 @@
 using System.Linq;
 using System.Reflection;
+using MelonLoader;
 using Mono.Cecil;
 using Mono.Cecil.Rocks;
 using Mono.Cecil.Cil;
@@ -94,21 +95,34 @@ namespace UMMBridge
             {
                 var mr = (MethodReference)inst.Operand;
 
-                // Pad missing optional params (transpiler, finalizer) with null
-                if (mr.Parameters.Count < 5)
+                // ProxyPatch() takes (harmony, original, prefix, postfix,
+                // transpiler, finalizer).  Harmony 2.3.x exposes overloads with
+                // 1..5 of those, and the compiler only emits the arguments the
+                // mod actually passed, so pad the tail with nulls.
+                if (mr.Parameters.Count > 5)
                 {
-                    il.InsertBefore(inst, il.Create(OpCodes.Ldnull));
+                    // Wider overload (e.g. HarmonyX's ilmanipulator): the extra
+                    // argument has no counterpart in the proxy, and rewriting the
+                    // call would leave the evaluation stack unbalanced.
+                    Melon<Bridge>.Logger.Warning(
+                        $"Not rewriting Harmony.Patch() with {mr.Parameters.Count} parameters in " +
+                        $"{method.DeclaringType?.Name}.{method.Name} — call kept on the native runtime");
+                    continue;
+                }
+
+                for (int i = mr.Parameters.Count; i < 5; i++)
+                {
                     il.InsertBefore(inst, il.Create(OpCodes.Ldnull));
                 }
 
-                // Handle return type mismatch: pop MethodInfo, push null PatchResult
-                var popInst = il.Create(OpCodes.Pop);
-                var nullInst = il.Create(OpCodes.Ldnull);
-                il.InsertAfter(inst, popInst);
-                il.InsertAfter(popInst, nullInst);
-
-                // Replace call target: callvirt → static call
-                inst.OpCode = OpCodes.Call;
+                // No stack fix-up is required: Harmony.Patch() and ProxyPatch()
+                // both return System.Reflection.MethodInfo, so the single value
+                // the original call pushed is exactly what the caller expects.
+                //
+                // Discarding it and pushing null instead (as this rewrite used
+                // to do) silently changed every "MethodInfo m = harmony.Patch(…)"
+                // into a null reference, which then failed far away from here.
+                inst.OpCode = OpCodes.Call; // instance method → static proxy
                 inst.Operand = proxyRef;
             }
 
