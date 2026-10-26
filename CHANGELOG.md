@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.0.7
+
+### 中文
+
+- **修复 `PatchClassProcessor.Unpatch()` 的 `MissingMethodException`** — 带「加载器 + 核心 DLL」结构的 UMM mod（如 JipperOverlayer：`JipperOverlayer.Loader.UMM.dll` 引用同目录的 `JipperOverlayer.dll`）此前会绕过 Cecil 重写：加载器本身没有 `0Harmony` 引用，重写无事可做，于是回退到 UMM 自己的 `Assembly.LoadFrom`，CLR 随即用 LoadFrom 上下文的同目录探测把核心 DLL 原样绑定，`0Harmony` 落到了 HarmonyX 2.10.2 上。而 HarmonyX 并没有 `PatchClassProcessor.Unpatch()`（也没有 `HarmonyLib.AccessToolsExtensions`、`AccessTools.MethodDelegate(MethodInfo, object, bool, Type[])`），mod 一按按钮就抛异常
+- **改写 `Assembly.LoadFrom` 前缀** — 即使文件里没有可重写的内容，也改为 `Assembly.Load(byte[])` 从字节加载；无上下文程序集无法自行探测同目录依赖，于是依赖会走 `AssemblyResolve`，在那里完成重写后再加载。实测日志：`JipperOverlayer.dll → ProxyPatch` / `Patched assembly: JipperOverlayer.dll` / `AssemblyResolve: served JipperOverlayer from ...\UMMMods\JipperOverlayer`
+- **解析器兜底改为 2.3.6** — 若某个已注册 mod 仍未重写就来要 `0Harmony`，现在返回 0Harmony_UMM（真实 2.3.x API 面）而不是 HarmonyX，只会记一条告警而不是直接崩溃；非 mod 调用方仍拿 HarmonyX
+- **核心程序集短路** — `OnAssemblyResolve` 对 `0Harmony`/`UnityModManager`/`System.*`/`UnityEngine.*` 等核心名字只返回已加载的实例，绝不再从 mod 目录里加载同名副本，避免第二份类型标识；同时按简单名回退，保证 `Managed\UnityModManager` 里的 UnityModManager 能被 mod 绑定
+- **离线核对** — 用 Cecil 扫描了全部已装 UMM mod 对 `0Harmony` 的引用：真实 2.3.6 全部命中，HarmonyX 2.10.2 缺 5 个成员（`PatchClassProcessor.Unpatch`、`HarmonyLib.AccessToolsExtensions` 的 Field/Method/Property、`AccessTools.MethodDelegate(MethodInfo, object, bool, Type[])`）
+
+### English
+
+- **Fixes the `MissingMethodException` on `PatchClassProcessor.Unpatch()`** — UMM mods shaped as "loader + core DLL" (e.g. JipperOverlayer: `JipperOverlayer.Loader.UMM.dll` references the sibling `JipperOverlayer.dll`) bypassed the Cecil rewrite entirely: the loader has no `0Harmony` reference, so there was nothing to rewrite and the bridge handed the load back to UMM's own `Assembly.LoadFrom`. The CLR then satisfied the loader's reference to the core DLL by probing the same directory inside the LoadFrom context, binding it raw; its `0Harmony` reference landed on HarmonyX 2.10.2, which has no `PatchClassProcessor.Unpatch()` (nor `HarmonyLib.AccessToolsExtensions`, nor `AccessTools.MethodDelegate(MethodInfo, object, bool, Type[])`), so the first button press threw
+- **`Assembly.LoadFrom` prefix reworked** — even when a file contains nothing to rewrite it is now loaded with `Assembly.Load(byte[])`. A no-context assembly cannot probe sibling files on its own, so its dependencies come back through `AssemblyResolve` and get rewritten before loading. Observed: `JipperOverlayer.dll → ProxyPatch` / `Patched assembly: JipperOverlayer.dll` / `AssemblyResolve: served JipperOverlayer from ...\UMMMods\JipperOverlayer`
+- **Resolver fallback now serves 2.3.6** — if a registered mod still asks for `0Harmony` without having been rewritten, it now receives 0Harmony_UMM (the real 2.3.x API surface) instead of HarmonyX, which logs a warning instead of crashing; non-mod callers keep getting HarmonyX
+- **Core assembly short-circuit** — `OnAssemblyResolve` returns only an already-loaded instance for core names (`0Harmony`, `UnityModManager`, `System.*`, `UnityEngine.*`, …) and never loads a same-named copy out of a mods folder, avoiding a second type identity; the simple-name fallback keeps the `Managed\UnityModManager` copy bindable by mods
+- **Offline audit** — Cecil-scanned every installed UMM mod's `0Harmony` references: real 2.3.6 satisfies all of them, while HarmonyX 2.10.2 is missing 5 members (`PatchClassProcessor.Unpatch`, `HarmonyLib.AccessToolsExtensions` Field/Method/Property, `AccessTools.MethodDelegate(MethodInfo, object, bool, Type[])`)
+
 ## v0.0.6
 
 ### 中文

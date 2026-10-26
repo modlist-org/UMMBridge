@@ -42,3 +42,6 @@ bld/
 *.csproj.user
 *.dbmdl
 *.jfm
+
+## Local agent diagnostics (IL scanners, scratch output)
+.diag/

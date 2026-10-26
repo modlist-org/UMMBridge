@@ -49,8 +49,41 @@ namespace UMMBridge
             if (name == "0Harmony_UMM" && _ummHarmony != null)
                 return _ummHarmony;
 
-            if (name == "0Harmony" && _harmonyX != null)
-                return _harmonyX;
+            if (name == "0Harmony")
+            {
+                // A rewritten mod asks for 0Harmony_UMM, so this only happens
+                // when the rewrite was missed.  The mod was compiled against
+                // vanilla 0Harmony and HarmonyX is not a superset of it: it has
+                // no PatchClassProcessor.Unpatch, no HarmonyLib.AccessToolsExtensions
+                // and no AccessTools.MethodDelegate(MethodInfo, object, bool, Type[]).
+                // Serve the 2.3.6 surface the mod was built against instead of
+                // letting it bind HarmonyX and die on MissingMethodException.
+                if (args.RequestingAssembly != null &&
+                    IsRegisteredModAssembly(args.RequestingAssembly))
+                {
+                    Melon<Bridge>.Logger.Warning(
+                        $"0Harmony requested by mod assembly " +
+                        $"'{args.RequestingAssembly.GetName().Name}' was not rewritten " +
+                        "to 0Harmony_UMM; serving the vanilla 2.3.6 surface");
+
+                    if (_ummHarmony != null)
+                        return _ummHarmony;
+                }
+                if (_harmonyX != null)
+                    return _harmonyX;
+            }
+
+            // Core runtime assemblies must never be served out of a mods folder:
+            // mods routinely bundle their own 0Harmony/Newtonsoft copies and a
+            // stray copy there cannot satisfy the vanilla typing this bridge relies on.
+            if (IsCoreAssemblyName(name))
+            {
+                // Serve the live copy when there is one: UMM itself lives in
+                // Managed\UnityModManager, which the default probe does not
+                // cover, so mods referencing UnityModManager only bind because
+                // the already-loaded instance is found by simple name.
+                return FindLoadedAssembly(name);
+            }
 
             // Return an already-loaded assembly if one exists.  Prevents
             // duplicate loads of game assemblies from UMMMods directories,
@@ -71,9 +104,16 @@ namespace UMMBridge
                     var path = Path.Combine(dir, name + ".dll");
                     if (File.Exists(path))
                     {
-                        Melon<Bridge>.Logger.Msg($"AssemblyResolve: served {name} from {dir}");
-                        var asm = Assembly.LoadFrom(path);
-                        _assemblyCache[name] = asm;
+                        // Load through the Cecil pipeline: a mod's compile-time
+                        // dependency can itself reference 0Harmony (e.g. a UMM
+                        // loader whose core DLL lives next to it), and binding
+                        // it raw leaves it on HarmonyX.
+                        var asm = LoadModAssembly(path);
+                        if (asm != null)
+                        {
+                            _assemblyCache[name] = asm;
+                            Melon<Bridge>.Logger.Msg($"AssemblyResolve: served {name} from {dir}");
+                        }
                         return asm;
                     }
                     return null;
@@ -89,19 +129,135 @@ namespace UMMBridge
                     if (found != null)
                     {
                         var modDir = Path.GetDirectoryName(found);
-                        lock (_assemblyToDir)
+                        var asm = LoadModAssembly(found);
+                        if (asm != null)
                         {
-                            _assemblyToDir[name] = modDir;
-                            var asm = Assembly.LoadFrom(found);
-                            _assemblyCache[name] = asm;
+                            lock (_assemblyToDir)
+                            {
+                                _assemblyToDir[name] = modDir;
+                                _assemblyCache[name] = asm;
+                            }
                             Melon<Bridge>.Logger.Msg($"AssemblyResolve: served {name} (scanned from {modDir})");
-                            return asm;
                         }
+                        return asm;
                     }
                 }
                 catch { }
             }
 
+            return null;
+        }
+
+        /// <summary>
+        /// Loads a mod-owned assembly through the Cecil rewrite, then from bytes.
+        ///
+        /// <para>Bytes, not LoadFrom: LoadFrom would publish the file into the
+        /// LoadFrom context and let the CLR satisfy the mod's compile-time
+        /// dependencies by probing sibling files itself, returning them raw.
+        /// That is exactly how JipperOverlayer.dll kept binding HarmonyX
+        /// 0Harmony and blew up on PatchClassProcessor.Unpatch().  With the
+        /// bytes load the dependency is unresolvable, so it comes back through
+        /// <see cref="OnAssemblyResolve"/> and gets rewritten here.</para>
+        /// </summary>
+        private static Assembly LoadModAssembly(string path)
+        {
+            try
+            {
+                RegisterModDirectory(path);
+
+                var patched = PatchAssemblyFile(path);
+                if (patched == null)
+                {
+                    // Nothing to rewrite.  Still load from bytes so that the
+                    // assembly's own dependencies cannot be probed from disk
+                    // behind the rewriter's back.
+                    try { patched = File.ReadAllBytes(path); }
+                    catch (Exception e)
+                    {
+                        Melon<Bridge>.Logger.Warning(
+                            $"AssemblyResolve: cannot read {Path.GetFileName(path)}: {e.Message}");
+                        return null;
+                    }
+                }
+
+                _currentLoadingPath = path;
+                try
+                {
+                    var asm = Assembly.Load(patched);
+                    _assemblyOriginalPath.Add(asm, path);
+                    return asm;
+                }
+                finally
+                {
+                    _currentLoadingPath = null;
+                }
+            }
+            catch (Exception e)
+            {
+                Melon<Bridge>.Logger.Warning(
+                    $"AssemblyResolve: failed to load {Path.GetFileName(path)}: {e.Message}");
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Assemblies owned by the loader/runtime.  A copy of one of these inside
+        /// a mods folder must not be loaded by the bridge: it would create a
+        /// second identity (and HarmonyX's 0Harmony does not carry the vanilla
+        /// APIs UMM mods are compiled against).
+        /// </summary>
+        private static bool IsCoreAssemblyName(string name)
+        {
+            switch (name)
+            {
+                case "0Harmony":
+                case "0Harmony_UMM":
+                case "0HarmonyX":
+                case "UnityModManager":
+                case "dnlib":
+                case "MelonLoader":
+                case "Assembly-CSharp":
+                case "Assembly-CSharp-firstpass":
+                case "mscorlib":
+                case "netstandard":
+                    return true;
+            }
+
+            return name.StartsWith("System", StringComparison.Ordinal)
+                || name.StartsWith("Mono", StringComparison.Ordinal)
+                || name.StartsWith("Unity.", StringComparison.Ordinal)
+                || name.StartsWith("UnityEngine", StringComparison.Ordinal)
+                || name.StartsWith("Il2Cpp", StringComparison.Ordinal)
+                || name.StartsWith("Microsoft.", StringComparison.Ordinal)
+                || name.StartsWith("Newtonsoft.Json", StringComparison.Ordinal);
+        }
+
+        /// <summary>
+        /// Assembly simple name of a path, tolerating UMM's cache naming
+        /// (<c>Foo.dll.1234.cache</c> names the assembly <c>Foo</c>).
+        /// </summary>
+        private static string GetModuleName(string path)
+        {
+            var file = Path.GetFileName(path);
+            var cut = file.IndexOf(".dll", StringComparison.OrdinalIgnoreCase);
+            return cut >= 0 ? file.Substring(0, cut) : Path.GetFileNameWithoutExtension(file);
+        }
+
+        /// <summary>
+        /// True when an assembly with this simple name is already live in the
+        /// domain.  Re-loading it from a mods folder would fork its identity.
+        /// </summary>
+        private static bool IsAlreadyLoaded(string name)
+            => FindLoadedAssembly(name) != null;
+
+        /// <summary>The already-loaded assembly with this simple name, if any.</summary>
+        private static Assembly FindLoadedAssembly(string name)
+        {
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                if (string.Equals(asm.GetName().Name, name, StringComparison.OrdinalIgnoreCase))
+                    return asm;
+            }
             return null;
         }
 
@@ -369,15 +525,36 @@ namespace UMMBridge
             if (!assemblyFile.Contains(ModsDirName))
                 return true;
 
+            var moduleName = GetModuleName(assemblyFile);
+
+            // A runtime assembly that a mod happens to ship next to itself is not
+            // a mod.  Letting the CLR satisfy it keeps a single identity for it;
+            // loading it from here would fork the type system.
+            if (IsCoreAssemblyName(moduleName) || IsAlreadyLoaded(moduleName))
+                return true;
+
             RegisterModDirectory(assemblyFile);
 
             var patched = PatchAssemblyFile(assemblyFile);
             if (patched == null)
-                return true;
+            {
+                // Nothing to rewrite in this file, but still take over the load.
+                // Returning true lets UMM's LoadFrom publish the file into the
+                // LoadFrom context, and the CLR then satisfies the mod's own
+                // compile-time dependencies by probing that same folder — handing
+                // them back raw and unrewritten.  JipperOverlayer.dll (the core
+                // DLL sitting next to its UMM loader) was bound to HarmonyX
+                // 0Harmony exactly that way.
+                try { patched = File.ReadAllBytes(assemblyFile); }
+                catch { return true; }
+            }
 
-            // Write to temp file and load via LoadFrom to preserve CLR type
-            // identity (LoadFrom context).  Assembly.Load(byte[]) creates a
-            // no-context assembly whose generic types differ from the game's.
+            // Load from bytes, never LoadFrom.  The bytes stay patched, but more
+            // importantly a no-context assembly cannot satisfy its own
+            // compile-time references by probing sibling files — each of them
+            // comes back through OnAssemblyResolve and gets rewritten too.
+            // (The no-context copy of a *game* assembly would fork its generic
+            // types, so the resolve handler always prefers a live copy.)
             _currentLoadingPath = assemblyFile;
             try
             {

@@ -5,5 +5,5 @@ using MelonLoader;
 [assembly: System.Reflection.AssemblyTitle("UMMBridge")]
 [assembly: System.Reflection.AssemblyCompany("UMMBridge")]
 [assembly: System.Reflection.AssemblyProduct("UMMBridge")]
-[assembly: System.Reflection.AssemblyVersion("0.0.6.0")]
-[assembly: System.Reflection.AssemblyFileVersion("0.0.6.0")]
+[assembly: System.Reflection.AssemblyVersion("0.0.7.0")]
+[assembly: System.Reflection.AssemblyFileVersion("0.0.7.0")]
