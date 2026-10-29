@@ -525,50 +525,79 @@ namespace UMMBridge
             if (!assemblyFile.Contains(ModsDirName))
                 return true;
 
-            var moduleName = GetModuleName(assemblyFile);
-
-            // A runtime assembly that a mod happens to ship next to itself is not
-            // a mod.  Letting the CLR satisfy it keeps a single identity for it;
-            // loading it from here would fork the type system.
-            if (IsCoreAssemblyName(moduleName) || IsAlreadyLoaded(moduleName))
-                return true;
-
-            RegisterModDirectory(assemblyFile);
-
-            var patched = PatchAssemblyFile(assemblyFile);
-            if (patched == null)
-            {
-                // Nothing to rewrite in this file, but still take over the load.
-                // Returning true lets UMM's LoadFrom publish the file into the
-                // LoadFrom context, and the CLR then satisfies the mod's own
-                // compile-time dependencies by probing that same folder — handing
-                // them back raw and unrewritten.  JipperOverlayer.dll (the core
-                // DLL sitting next to its UMM loader) was bound to HarmonyX
-                // 0Harmony exactly that way.
-                try { patched = File.ReadAllBytes(assemblyFile); }
-                catch { return true; }
-            }
-
-            // Load from bytes, never LoadFrom.  The bytes stay patched, but more
-            // importantly a no-context assembly cannot satisfy its own
-            // compile-time references by probing sibling files — each of them
-            // comes back through OnAssemblyResolve and gets rewritten too.
-            // (The no-context copy of a *game* assembly would fork its generic
-            // types, so the resolve handler always prefers a live copy.)
-            _currentLoadingPath = assemblyFile;
             try
             {
-                // Load from bytes (no-context) so that all assembly references
-                // resolve through the default Load context — no duplicate
-                // loading of game assemblies (Assembly-CSharp stays single).
-                var asm = Assembly.Load(patched);
-                _assemblyOriginalPath.Add(asm, assemblyFile);
-                __result = asm;
-                return false;
+                var moduleName = GetModuleName(assemblyFile);
+
+                // A runtime assembly that a mod happens to ship next to itself is
+                // not a mod.  Letting the CLR satisfy it keeps a single identity
+                // for it; loading it from here would fork the type system.
+                if (IsCoreAssemblyName(moduleName) || IsAlreadyLoaded(moduleName))
+                    return true;
+
+                RegisterModDirectory(assemblyFile);
+
+                var patched = PatchAssemblyFile(assemblyFile);
+                if (patched == null)
+                {
+                    // Nothing to rewrite in this file, but still take over the
+                    // load.  Returning true lets UMM's LoadFrom publish the file
+                    // into the LoadFrom context, and the CLR then satisfies the
+                    // mod's own compile-time dependencies by probing that same
+                    // folder — handing them back raw and unrewritten.
+                    // JipperOverlayer.dll (the core DLL sitting next to its UMM
+                    // loader) was bound to HarmonyX 0Harmony exactly that way.
+                    try { patched = File.ReadAllBytes(assemblyFile); }
+                    catch { return true; }
+                }
+
+                // Load from bytes, never LoadFrom.  The bytes stay patched, but
+                // more importantly a no-context assembly cannot satisfy its own
+                // compile-time references by probing sibling files — each of them
+                // comes back through OnAssemblyResolve and gets rewritten too.
+                // (The no-context copy of a *game* assembly would fork its
+                // generic types, so the resolve handler always prefers a live
+                // copy.)
+                _currentLoadingPath = assemblyFile;
+                try
+                {
+                    var asm = Assembly.Load(patched);
+                    _assemblyOriginalPath.Add(asm, assemblyFile);
+                    __result = asm;
+                    return false;
+                }
+                finally
+                {
+                    _currentLoadingPath = null;
+                }
             }
-            finally
+            catch (Exception e)
             {
-                _currentLoadingPath = null;
+                // Whatever goes wrong in the rewrite, the mod still has to load.
+                // Falling back to its own bytes (not to LoadFrom) keeps the
+                // no-context guarantee — and therefore keeps the rewrite
+                // guarantee for its dependencies — and only leaves this one file
+                // unpatched.
+                Melon<Bridge>.Logger.Warning(
+                    $"LoadFrom interception failed for {Path.GetFileName(assemblyFile)} " +
+                    $"({e.GetType().Name}: {e.Message}) — loading it unrewritten");
+
+                _currentLoadingPath = assemblyFile;
+                try
+                {
+                    var raw = Assembly.Load(File.ReadAllBytes(assemblyFile));
+                    _assemblyOriginalPath.Add(raw, assemblyFile);
+                    __result = raw;
+                    return false;
+                }
+                catch
+                {
+                    return true;
+                }
+                finally
+                {
+                    _currentLoadingPath = null;
+                }
             }
         }
     }

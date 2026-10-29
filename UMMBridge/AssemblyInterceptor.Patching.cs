@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -25,10 +26,19 @@ namespace UMMBridge
             try { originalBytes = File.ReadAllBytes(filePath); }
             catch { return null; }
 
+            // Cecil resolves external assemblies lazily: writing the module forces
+            // it to the type behind every const field, and a module read from a
+            // Stream carries no search directory at all (only a path read adds
+            // one).  Give it a resolver that knows this mod's neighbourhood, or a
+            // const of a sibling DLL's enum fails the whole rewrite.
+            using var resolver = CreateModCecilResolver(filePath);
+
             AssemblyDefinition asmDef;
             try
             {
-                asmDef = AssemblyDefinition.ReadAssembly(new MemoryStream(originalBytes));
+                asmDef = AssemblyDefinition.ReadAssembly(
+                    new MemoryStream(originalBytes),
+                    new ReaderParameters { AssemblyResolver = resolver });
             }
             catch
             {
@@ -221,6 +231,157 @@ namespace UMMBridge
                 Melon<Bridge>.Logger.Msg(
                     "  Creplay fix: sortedKeyQueue_instance → object");
             return modified;
+        }
+
+        // ── Cecil assembly resolution ───────────────────────────────────
+
+        /// <summary>
+        /// Resolver handed to Cecil for a mod-owned file.
+        ///
+        /// <para>Writing a module back makes Cecil resolve types lazily — a
+        /// <c>const</c> field forces <c>MetadataBuilder.GetConstantType</c> to
+        /// call <c>TypeReference.Resolve()</c>.  Modules are read from a
+        /// <see cref="MemoryStream"/> here, and only a path read teaches
+        /// <see cref="DefaultAssemblyResolver"/> where to look, so without this
+        /// the rewrite dies on any const typed by a sibling DLL's enum:
+        /// CheryTools.Sonnet.Framework has a const of an ImGui.NET enum next to
+        /// ImGui.NET.dll, and the failure surfaced as
+        /// <c>AssemblyResolutionException: Failed to resolve assembly: 'ImGui.NET'</c>
+        /// while loading the mod.</para>
+        /// </summary>
+        private sealed class ModCecilResolver : DefaultAssemblyResolver
+        {
+            public override AssemblyDefinition Resolve(AssemblyNameReference name)
+                => Resolve(name, new ReaderParameters { AssemblyResolver = this });
+
+            public override AssemblyDefinition Resolve(
+                AssemblyNameReference name, ReaderParameters parameters)
+            {
+                // 0Harmony_UMM only exists as an in-memory rename of vanilla
+                // 0Harmony, so a reference to it can only be resolved from disk
+                // under its original name.
+                if (name.Name == "0Harmony_UMM")
+                    name = new AssemblyNameReference("0Harmony", name.Version);
+
+                try
+                {
+                    return base.Resolve(name, new ReaderParameters
+                    {
+                        AssemblyResolver = this,
+                        ReadingMode = ReadingMode.Deferred,
+                    });
+                }
+                catch (AssemblyResolutionException)
+                {
+                }
+
+                // Last chance: a copy the runtime already loaded.  This covers
+                // assemblies whose folder we never guessed, and mod assemblies
+                // that were byte-loaded from a cache file.
+                var loaded = FindLoadedAssembly(name.Name);
+                if (loaded != null && !string.IsNullOrEmpty(loaded.Location))
+                {
+                    try
+                    {
+                        return AssemblyDefinition.ReadAssembly(loaded.Location, new ReaderParameters
+                        {
+                            AssemblyResolver = this,
+                            ReadingMode = ReadingMode.Deferred,
+                        });
+                    }
+                    catch
+                    {
+                    }
+                }
+
+                throw new AssemblyResolutionException(name);
+            }
+        }
+
+        /// <summary>
+        /// A Cecil resolver that can see everything a mod might reference: its
+        /// own folder (UMM cache files and the DLLs shipped beside them), every
+        /// UMM mod folder, the game's Managed folder, UMM's folder (vanilla
+        /// 0Harmony) and MelonLoader's (HarmonyX, Cecil itself).
+        /// </summary>
+        private static ModCecilResolver CreateModCecilResolver(string filePath)
+        {
+            var resolver = new ModCecilResolver();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            void Add(string dir)
+            {
+                if (string.IsNullOrEmpty(dir)) return;
+                try
+                {
+                    if (!Directory.Exists(dir)) return;
+                    var full = Path.GetFullPath(dir);
+                    if (!seen.Add(full)) return;
+                    resolver.AddSearchDirectory(full);
+                }
+                catch
+                {
+                }
+            }
+
+            // The file itself first: a mod keeps its dependencies next to it
+            // (CheryTools holds ImGui.NET.dll there and its own DLLs one level
+            // down in Modules\).
+            var ownDir = Path.GetDirectoryName(filePath);
+            Add(ownDir);
+            if (ownDir != null)
+            {
+                try
+                {
+                    foreach (var sub in Directory.GetDirectories(ownDir))
+                        Add(sub);
+                }
+                catch
+                {
+                }
+            }
+
+            // Every mod folder, so one mod can resolve a dependency shipped by
+            // another.
+            Add(ModsRootPath);
+            try
+            {
+                foreach (var dir in Directory.GetDirectories(ModsRootPath, "*", SearchOption.AllDirectories))
+                    Add(dir);
+            }
+            catch
+            {
+            }
+
+            // Runtime assemblies.
+            try { Add(Path.GetDirectoryName(typeof(UnityEngine.GameObject).Assembly.Location)); }
+            catch { }
+            try { Add(Path.GetDirectoryName(typeof(UnityModManagerNet.UnityModManager).Assembly.Location)); }
+            catch { }
+            try
+            {
+                var melonDir = Path.GetDirectoryName(typeof(AssemblyDefinition).Assembly.Location);
+                Add(melonDir);
+
+                var melonRoot = Path.GetDirectoryName(melonDir);
+                Add(melonRoot);
+                if (melonRoot != null)
+                {
+                    foreach (var sub in new[] { "net35", "net472", "net6", "Dependencies" })
+                        Add(Path.Combine(melonRoot, sub));
+
+                    var deps = Path.Combine(melonRoot, "Dependencies");
+                    Add(deps);
+                    Add(Path.Combine(deps, "SupportModules"));
+                }
+            }
+            catch
+            {
+            }
+            try { Add(Path.GetDirectoryName(typeof(Bridge).Assembly.Location)); }
+            catch { }
+
+            return resolver;
         }
     }
 }

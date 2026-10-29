@@ -9,6 +9,8 @@
 - **解析器兜底改为 2.3.6** — 若某个已注册 mod 仍未重写就来要 `0Harmony`，现在返回 0Harmony_UMM（真实 2.3.x API 面）而不是 HarmonyX，只会记一条告警而不是直接崩溃；非 mod 调用方仍拿 HarmonyX
 - **核心程序集短路** — `OnAssemblyResolve` 对 `0Harmony`/`UnityModManager`/`System.*`/`UnityEngine.*` 等核心名字只返回已加载的实例，绝不再从 mod 目录里加载同名副本，避免第二份类型标识；同时按简单名回退，保证 `Managed\UnityModManager` 里的 UnityModManager 能被 mod 绑定
 - **离线核对** — 用 Cecil 扫描了全部已装 UMM mod 对 `0Harmony` 的引用：真实 2.3.6 全部命中，HarmonyX 2.10.2 缺 5 个成员（`PatchClassProcessor.Unpatch`、`HarmonyLib.AccessToolsExtensions` 的 Field/Method/Property、`AccessTools.MethodDelegate(MethodInfo, object, bool, Type[])`）
+- **修复 Cecil 写回时的 `AssemblyResolutionException`** — 程序集是用 `MemoryStream` 读的，而 Cecil 的 `DefaultAssemblyResolver` 只有在**按路径**读取时才会把该目录加入搜索列表，读流时列表为空；写回元数据时 `MetadataBuilder.GetConstantType` 需要解析 `const` 字段的类型，于是 CheryTools.Sonnet.Framework（含一个 ImGui.NET 枚举类型的 `const`，旁边就放着 `ImGui.NET.dll`）报 `Failed to resolve assembly: 'ImGui.NET'`，整个 mod 加载失败。现在改为传入专用解析器：搜索被改写文件所在目录及其子目录（如 `Modules\`）、所有 UMM mod 目录、游戏 `Managed`、UMM 目录（原版 0Harmony）与 MelonLoader 目录（HarmonyX、Cecil），并把 `0Harmony_UMM` 映射回磁盘上的 `0Harmony`
+- **重写失败不再拖垮 mod** — `Prefix_LoadFrom` 现在整体兜住异常：改写出错时回退为「按原始字节加载但未重写」并输出告警，而不是把异常漏给 UMM 导致 mod 完全无法加载（CheryTools 之前正是这样挂掉的）
 
 ### English
 
@@ -17,6 +19,8 @@
 - **Resolver fallback now serves 2.3.6** — if a registered mod still asks for `0Harmony` without having been rewritten, it now receives 0Harmony_UMM (the real 2.3.x API surface) instead of HarmonyX, which logs a warning instead of crashing; non-mod callers keep getting HarmonyX
 - **Core assembly short-circuit** — `OnAssemblyResolve` returns only an already-loaded instance for core names (`0Harmony`, `UnityModManager`, `System.*`, `UnityEngine.*`, …) and never loads a same-named copy out of a mods folder, avoiding a second type identity; the simple-name fallback keeps the `Managed\UnityModManager` copy bindable by mods
 - **Offline audit** — Cecil-scanned every installed UMM mod's `0Harmony` references: real 2.3.6 satisfies all of them, while HarmonyX 2.10.2 is missing 5 members (`PatchClassProcessor.Unpatch`, `HarmonyLib.AccessToolsExtensions` Field/Method/Property, `AccessTools.MethodDelegate(MethodInfo, object, bool, Type[])`)
+- **Fixes the `AssemblyResolutionException` thrown while Cecil writes a module back** — assemblies are read from a `MemoryStream`, and Cecil's `DefaultAssemblyResolver` only gains a search directory when a module is read *from a path*, so its list is empty. Writing metadata then needs the type behind a `const` field (`MetadataBuilder.GetConstantType` → `TypeReference.Resolve()`), and CheryTools.Sonnet.Framework — which has a `const` of an ImGui.NET enum with `ImGui.NET.dll` right next to it — failed with `Failed to resolve assembly: 'ImGui.NET'`, taking the whole mod down. The reader is now given a resolver that searches the patched file's own folder and subfolders (e.g. `Modules\`), every UMM mod folder, the game's `Managed` folder, UMM's folder (vanilla 0Harmony) and MelonLoader's (HarmonyX, Cecil), and maps `0Harmony_UMM` back to the on-disk `0Harmony`
+- **A failed rewrite can no longer take a mod down** — `Prefix_LoadFrom` now wraps the whole path: on a rewrite failure it falls back to loading the original bytes unrewritten and logs a warning, instead of leaking the exception into UMM and preventing the mod from loading at all (which is exactly how CheryTools was dying)
 
 ## v0.0.6
 
