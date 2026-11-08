@@ -81,6 +81,10 @@
       <HintPath>$(GameRootDir)MelonLoader/$(MelonLoaderTarget)/Mono.Cecil.Rocks.dll</HintPath>
       <Private>False</Private>
     </Reference>
+    <Reference Include="MonoMod.RuntimeDetour">
+      <HintPath>$(GameRootDir)MelonLoader/$(MelonLoaderTarget)/MonoMod.RuntimeDetour.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
   </ItemGroup>
   <!-- Fallback reference locations.  These do not replace the HintPaths above:
        each one only applies when the original file does not exist, so an actual
@@ -98,6 +102,9 @@
     <Reference Update="Mono.Cecil.Rocks" Condition="!Exists('$(GameRootDir)MelonLoader/$(MelonLoaderTarget)/Mono.Cecil.Rocks.dll')">
       <HintPath>$(LibsMelonLoaderDir)Mono.Cecil.Rocks.dll</HintPath>
     </Reference>
+    <Reference Update="MonoMod.RuntimeDetour" Condition="!Exists('$(GameRootDir)MelonLoader/$(MelonLoaderTarget)/MonoMod.RuntimeDetour.dll')">
+      <HintPath>$(LibsMelonLoaderDir)MonoMod.RuntimeDetour.dll</HintPath>
+    </Reference>
     <Reference Update="UnityEngine.CoreModule" Condition="!Exists('$(UnityAssembliesDir)UnityEngine.CoreModule.dll')">
       <HintPath>$(LibsDir)UnityEngine.CoreModule.dll</HintPath>
     </Reference>
@@ -114,9 +121,7 @@
   <ItemGroup>
     <Compile Include="AssemblyInterceptor.cs" />
     <Compile Include="AssemblyInterceptor.Patching.cs" />
-    <Compile Include="AssemblyInterceptor.Transpiler.cs" />
     <Compile Include="Bridge.cs" />
-    <Compile Include="TranspilerBridge.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>
 </Project>

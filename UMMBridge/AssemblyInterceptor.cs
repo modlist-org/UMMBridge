@@ -28,11 +28,12 @@ namespace UMMBridge
         internal const string ModsDirName = "UMMMods";
 
         /// <summary>
-        /// Full path to the UMM mods directory.
-        /// Derived from ModsDirName at first access.
+        /// Full path to the UMM mods directory, next to MelonLoader's Mods and
+        /// Plugins.  Not GameRootDirectory: on macOS that is
+        /// <c>&lt;Game&gt;.app/Contents/MacOS</c>.
         /// </summary>
         internal static string ModsRootPath =>
-            Path.Combine(MelonEnvironment.GameRootDirectory, ModsDirName);
+            Path.Combine(MelonEnvironment.MelonBaseDirectory, ModsDirName);
 
         private static readonly Dictionary<string, string> _assemblyToDir = new();
         private static readonly Dictionary<string, Assembly> _assemblyCache = new();
@@ -82,7 +83,7 @@ namespace UMMBridge
                 // Managed\UnityModManager, which the default probe does not
                 // cover, so mods referencing UnityModManager only bind because
                 // the already-loaded instance is found by simple name.
-                return FindLoadedAssembly(name);
+                return FindLoadedAssembly(name) ?? ResolveNetStandardForward(name);
             }
 
             // Return an already-loaded assembly if one exists.  Prevents
@@ -146,6 +147,31 @@ namespace UMMBridge
             }
 
             return null;
+        }
+
+        /// <summary>
+        /// A netstandard 2.0 facade (e.g. <c>UserLibs/netstandard.dll</c>) forwards
+        /// types such as <c>RuntimeInformation</c> to facade assemblies Unity does
+        /// not ship, which breaks SQLitePCL (TUFReplay).  Unity's own
+        /// netstandard.dll forwards the same types to mscorlib/System/System.Core,
+        /// so hand that out for any assembly a loaded netstandard facade refers to.
+        /// </summary>
+        private static Assembly ResolveNetStandardForward(string name)
+        {
+            var path = Path.Combine(Path.GetDirectoryName(typeof(UnityEngine.Object).Assembly.Location), "netstandard.dll");
+            var forwardedByFacade = AppDomain.CurrentDomain.GetAssemblies()
+                .Any(a => a.GetName().Name == "netstandard" && a.GetReferencedAssemblies().Any(r => r.Name == name));
+            if (!forwardedByFacade || !File.Exists(path))
+                return null;
+
+            var runtime = Assembly.LoadFrom(path);
+            // Never return it for a name it forwards to itself, or Mono would
+            // chase that forward forever.
+            if (runtime.GetReferencedAssemblies().Any(r => r.Name == name))
+                return null;
+
+            Melon<Bridge>.Logger.Msg($"AssemblyResolve: served {name} via runtime netstandard");
+            return runtime;
         }
 
         /// <summary>
@@ -316,44 +342,6 @@ namespace UMMBridge
             _ummHarmony = Assembly.Load(ummHarmonyBytes);
             Melon<Bridge>.Logger.Msg($"Loaded UMM 0Harmony as 0Harmony_UMM v{_ummHarmony.GetName().Version}");
 
-            // Hook 0Harmony_UMM's Harmony.Patch() via HarmonyX prefix.
-            // Prefix_UMMPatch hands the patch to HarmonyX whenever HarmonyX
-            // already owns the method entry (and for a UMM mod patch that
-            // carries a transpiler), so both runtimes' patches coexist on one
-            // detour instead of racing for the same JMP.
-            try
-            {
-                var ummHarmonyType = _ummHarmony.GetType("HarmonyLib.Harmony");
-                if (ummHarmonyType != null)
-                {
-                    var patchMethod = ummHarmonyType.GetMethod("Patch", new[] {
-                        typeof(MethodBase),
-                        ummHarmonyType.Assembly.GetType("HarmonyLib.HarmonyMethod"),
-                        ummHarmonyType.Assembly.GetType("HarmonyLib.HarmonyMethod"),
-                        ummHarmonyType.Assembly.GetType("HarmonyLib.HarmonyMethod"),
-                        ummHarmonyType.Assembly.GetType("HarmonyLib.HarmonyMethod")
-                    });
-                    if (patchMethod != null)
-                    {
-                        var bridgePrefix = typeof(Bridge).GetMethod(
-                            nameof(Bridge.Prefix_UMMPatch),
-                            BindingFlags.Public | BindingFlags.Static);
-                        if (bridgePrefix != null)
-                        {
-                            var h = new HarmonyLib.Harmony("UMMBridge.UMMHook");
-                            h.Patch(patchMethod, new HarmonyMethod(bridgePrefix));
-                            Melon<Bridge>.Logger.Msg(
-                                "0Harmony_UMM::Harmony.Patch() hooked — transpiler bridge active");
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Melon<Bridge>.Logger.Warning(
-                    $"Failed to hook 0Harmony_UMM Harmony.Patch(): {ex.Message}");
-            }
-
             try
             {
                 var h = new HarmonyLib.Harmony("UMMBridge.AssemblyInterceptor");
@@ -403,103 +391,57 @@ namespace UMMBridge
                 asmDef.Name.PublicKeyToken = Array.Empty<byte>();
                 asmDef.Name.PublicKey = Array.Empty<byte>();
 
-                // ── Only Cecil injection: PatchFunctions.UpdateWrapper() ──
-                // CreateClassProcessor/PatchAll calls bypass Harmony.Patch()
-                // and reach UpdateWrapper via ProcessPatchJob.  This injection
-                // routes a conflicting job through RouteConflictUpdateWrapper,
-                // which applies it on HarmonyX instead of writing a second
-                // native detour.
-                var patchFunctionsType = asmDef.MainModule.GetType("HarmonyLib.PatchFunctions");
-                if (patchFunctionsType == null)
+                // Every patch is built and applied by MelonLoader's HarmonyX; UMM's
+                // bundled MonoMod.Core never runs.  UpdateWrapper keeps its old body
+                // behind the redirect: JALib reverse patches it to build its own
+                // patches, and the detour at its end now hands the finished method
+                // to HarmonyX instead.
+                var module = asmDef.MainModule;
+                var updateWrapper = RedirectBody(module, "HarmonyLib.PatchFunctions", "UpdateWrapper", nameof(Bridge.UpdateWrapper), keepOriginal: true);
+                foreach (var inst in updateWrapper?.Body.Instructions ?? Enumerable.Empty<Instruction>())
                 {
-                    Melon<Bridge>.Logger.Warning(
-                        "0Harmony_UMM: HarmonyLib.PatchFunctions not found — PatchAll() jobs will bypass the conflict router");
+                    if (inst.Operand is MethodReference { Name: "DetourMethod" } called &&
+                        called.DeclaringType.FullName == "HarmonyLib.PatchTools")
+                        inst.Operand = module.ImportReference(typeof(Bridge).GetMethod(nameof(Bridge.ReplaceMethod)));
                 }
-                else
-                {
-                    var tracker3 = typeof(Bridge).GetMethod(
-                        nameof(Bridge.IsMethodPatchedByProxy),
-                        BindingFlags.Public | BindingFlags.Static,
-                        null, new[] { typeof(MethodBase) }, null);
-                    var routeMethod = typeof(Bridge).GetMethod(
-                        nameof(Bridge.RouteConflictUpdateWrapper),
-                        BindingFlags.Public | BindingFlags.Static,
-                        null, new[] { typeof(MethodBase), typeof(object) }, null);
-
-                    if (tracker3 == null || routeMethod == null)
-                    {
-                        Melon<Bridge>.Logger.Warning(
-                            "0Harmony_UMM: Bridge conflict-routing methods not found — PatchAll() jobs will bypass the conflict router");
-                    }
-                    else
-                    {
-                        var trackerRef3 = asmDef.MainModule.ImportReference(tracker3);
-                        var routeRef = asmDef.MainModule.ImportReference(routeMethod);
-                        var injected = 0;
-
-                        foreach (var m in patchFunctionsType.Methods)
-                        {
-                            if (m.Name != "UpdateWrapper" || !m.IsStatic || !m.HasBody) continue;
-
-                            // The hand-written IL below assumes exactly
-                            //   static MethodInfo UpdateWrapper(MethodBase, PatchInfo)
-                            // Anything else (extra parameter, PatchInfo turned into
-                            // a value type, different return) would emit IL that is
-                            // invalid for the callee and only fails when
-                            // 0Harmony_UMM is loaded — check the shape up front.
-                            if (m.ReturnType.FullName != "System.Reflection.MethodInfo") continue;
-                            if (m.Parameters.Count != 2) continue;
-                            if (m.Parameters[0].ParameterType.FullName != "System.Reflection.MethodBase") continue;
-                            if (m.Parameters[1].ParameterType.FullName != "HarmonyLib.PatchInfo") continue;
-                            if (m.Body.Instructions.Count == 0) continue;
-
-                            // A second rewrite of the same assembly must not inject
-                            // the router twice (it would recurse).
-                            if (m.Body.Instructions.Any(inst =>
-                                    inst.OpCode == OpCodes.Call &&
-                                    inst.Operand is MethodReference call &&
-                                    call.Name == nameof(Bridge.IsMethodPatchedByProxy)))
-                                continue;
-
-                            var il = m.Body.GetILProcessor();
-                            var first = m.Body.Instructions[0];
-
-                            // ldarg.0 → IsMethodPatchedByProxy → brfalse FIRST
-                            il.InsertBefore(first, il.Create(OpCodes.Ldarg, m.Parameters[0]));
-                            il.InsertBefore(first, il.Create(OpCodes.Call, trackerRef3));
-                            il.InsertBefore(first, il.Create(OpCodes.Brfalse, first));
-
-                            // Conflict → let RouteConflictUpdateWrapper apply the
-                            // job on HarmonyX (it returns the wrapper method).
-                            il.InsertBefore(first, il.Create(OpCodes.Ldarg, m.Parameters[0]));
-                            il.InsertBefore(first, il.Create(OpCodes.Ldarg, m.Parameters[1]));
-                            il.InsertBefore(first, il.Create(OpCodes.Call, routeRef));
-                            il.InsertBefore(first, il.Create(OpCodes.Ret));
-
-                            injected++;
-                        }
-
-                        if (injected == 0)
-                        {
-                            // Silently shipping without the router would let
-                            // PatchAll() write a second native detour onto a
-                            // HarmonyX-owned method, so say so loudly.
-                            Melon<Bridge>.Logger.Warning(
-                                "0Harmony_UMM: no PatchFunctions.UpdateWrapper(MethodBase, PatchInfo) overload found — " +
-                                "PatchAll() jobs will bypass the conflict router");
-                        }
-                        else
-                        {
-                            Melon<Bridge>.Logger.Msg(
-                                $"0Harmony_UMM: conflict router injected into {injected} UpdateWrapper overload(s)");
-                        }
-                    }
-                }
+                RedirectBody(module, "HarmonyLib.PatchTools", "DetourMethod", nameof(Bridge.DetourMethod));
+                RedirectBody(module, "HarmonyLib.AccessTools", "Identifiable", null);
 
                 using var outMs = new MemoryStream();
                 asmDef.Write(outMs);
                 return outMs.ToArray();
             }
+        }
+
+        /// <summary>
+        /// Makes a static method start with a call to the Bridge method taking the
+        /// same arguments (or <c>return arg0</c> when bridgeMethod is null).  The old
+        /// body is dropped unless keepOriginal, in which case it stays, unreachable.
+        /// </summary>
+        private static MethodDefinition RedirectBody(ModuleDefinition module, string typeName, string methodName, string bridgeMethod, bool keepOriginal = false)
+        {
+            var method = module.GetType(typeName)?.Methods.FirstOrDefault(m => m.Name == methodName && m.IsStatic && m.HasBody);
+            if (method == null)
+            {
+                Melon<Bridge>.Logger.Warning($"0Harmony_UMM: {typeName}.{methodName} not found; left as is");
+                return null;
+            }
+
+            var body = method.Body;
+            if (!keepOriginal)
+            {
+                body.Instructions.Clear();
+                body.ExceptionHandlers.Clear();
+                body.Variables.Clear();
+            }
+            var il = body.GetILProcessor();
+            var redirect = method.Parameters.Select(p => il.Create(OpCodes.Ldarg, p)).ToList();
+            if (bridgeMethod != null)
+                redirect.Add(il.Create(OpCodes.Call, module.ImportReference(typeof(Bridge).GetMethod(bridgeMethod))));
+            redirect.Add(il.Create(OpCodes.Ret));
+            for (var i = 0; i < redirect.Count; i++)
+                body.Instructions.Insert(i, redirect[i]);
+            return method;
         }
 
         // ── Harmony Prefix: LoadFrom ────────────────────────────────────

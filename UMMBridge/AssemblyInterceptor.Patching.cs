@@ -16,9 +16,7 @@ namespace UMMBridge
     {
         /// <summary>
         /// Cecil-rewrite a UMM mod assembly: replace 0Harmony→0Harmony_UMM,
-        /// optionally redirect Harmony.Patch() calls through ProxyPatch
-        /// (when no transpiler is present), rewrite get_Location() calls
-        /// and hardcoded "Mods" paths.
+        /// rewrite get_Location() calls and hardcoded "Mods" paths.
         /// </summary>
         private static byte[] PatchAssemblyFile(string filePath)
         {
@@ -58,30 +56,7 @@ namespace UMMBridge
                     harmonyRef.Name = "0Harmony_UMM";
                     harmonyRef.PublicKeyToken = Array.Empty<byte>();
                     modified = true;
-
-                    // Assembly-level transpiler check.  With the transpiler
-                    // bridge enabled, Patch() calls stay rewritten even for
-                    // assemblies that contain transpilers: ProxyPatch converts
-                    // each transpiler to HarmonyX instead of letting it claim a
-                    // second native detour.  Only a disabled bridge keeps such
-                    // assemblies on the native runtime.
-                    var bridgeTranspilers = TranspilerBridge.Enabled;
-                    var hasTranspiler = ModUsesTranspiler(asmDef);
-                    if (bridgeTranspilers || !hasTranspiler)
-                    {
-                        var rewrittenPatchCalls = RewriteHarmonyPatchCalls(asmDef);
-                        modified |= rewrittenPatchCalls;
-                        Melon<Bridge>.Logger.Msg(
-                            $"{Path.GetFileName(filePath)} → " +
-                            (rewrittenPatchCalls
-                                ? "ProxyPatch" + (bridgeTranspilers && hasTranspiler ? " (transpilers bridged)" : "")
-                                : "0Harmony_UMM (no Patch() calls rewritten)"));
-                    }
-                    else
-                    {
-                        Melon<Bridge>.Logger.Msg(
-                            $"{Path.GetFileName(filePath)} → 0Harmony_UMM (transpiler assembly)");
-                    }
+                    Melon<Bridge>.Logger.Msg($"{Path.GetFileName(filePath)} → 0Harmony_UMM");
                 }
 
                 // Creplay: fix cross-runtime as cast.  PriorityQueue<SkyHookEvent,ulong>

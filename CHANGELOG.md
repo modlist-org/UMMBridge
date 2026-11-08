@@ -1,5 +1,31 @@
 # Changelog
 
+## v1.3.0
+
+### 中文
+
+- **所有补丁统一由 HarmonyX 应用** — 0Harmony_UMM 的 `PatchFunctions.UpdateWrapper` 重定向到 `Bridge.UpdateWrapper`：UMM mod 的 prefix/postfix/finalizer 以各自的 Harmony ID 注册到 HarmonyX，transpiler 通过一个 HarmonyX transpiler 运行（在边界处转换 `CodeInstruction`）。UMM 与 MelonLoader 的补丁在同一方法上叠加，不再出现一方被拒绝或被覆盖
+- **Apple Silicon** — UMM 自带的 MonoMod.Core 在 Arm64 上抛出 `NotImplementedException`。`PatchTools.DetourMethod`（现在只有反向补丁会走到）改用 MelonLoader 的 MonoMod `NativeDetour`，`AccessTools.Identifiable` 不再经过 `PlatformTriple`
+- **macOS 路径** — `UMMMods` 改为放在 `MelonEnvironment.MelonBaseDirectory` 下；macOS 上 `GameRootDirectory` 是 `.app/Contents/MacOS`
+- **TUFReplay** — 已加载的 netstandard 2.0 facade（如 `UserLibs/netstandard.dll`）会把 `RuntimeInformation` 等类型转发到 Unity 没有的程序集；现在这类请求由 Unity 自带的 netstandard.dll 提供
+- **JALib** — JALib 反向补丁 `UpdateWrapper` 的原始 IL 来构建自己的补丁。`UpdateWrapper` 保留原方法体，其中的 detour 调用改为 `Bridge.ReplaceMethod`，把 JALib 生成的方法托管在 HarmonyX 中，MelonLoader 补丁仍会包裹它
+- **失败回滚** — 构建失败的 UMM 补丁会从 HarmonyX 撤回，不会拖累该方法之后的补丁
+- **移除** — `ProxyPatch`、`Harmony.Patch()` 前缀、按运行时归属的路由、`TranspilerBridge`，以及 `UMMBridge.cfg` / `UMMBRIDGE_TRANSPILER_BRIDGE` / `UMMBRIDGE_VERBOSE`（只剩一个运行时，无需选择）
+- **离线验证** — 使用真实 HarmonyX 2.10.2、0Harmony 2.3.6 与 JALib 1.0.0.45 发布版：UMM/MelonLoader/JALib 补丁在同一方法上共存、`UnpatchAll`、JALib 取消补丁、失败回滚、反向补丁
+- 包含 v1.2.1 的全部修复（v1.2.1 未单独发布）
+
+### English
+
+- **HarmonyX applies every patch** — 0Harmony_UMM's `PatchFunctions.UpdateWrapper` is redirected to `Bridge.UpdateWrapper`: a UMM mod's prefixes/postfixes/finalizers are registered on HarmonyX under the mod's own Harmony ID, and its transpilers run through one HarmonyX transpiler (`CodeInstruction` converted at the boundary). UMM and MelonLoader patches on one method now stack instead of one being refused or overwritten
+- **Apple Silicon** — the MonoMod.Core bundled with UMM's Harmony throws `NotImplementedException` on Arm64. `PatchTools.DetourMethod` (now reached by reverse patches only) uses MelonLoader's MonoMod `NativeDetour`, and `AccessTools.Identifiable` no longer goes through `PlatformTriple`
+- **macOS paths** — `UMMMods` now lives under `MelonEnvironment.MelonBaseDirectory`; on macOS `GameRootDirectory` is `.app/Contents/MacOS`
+- **TUFReplay** — a loaded netstandard 2.0 facade (e.g. `UserLibs/netstandard.dll`) forwards types such as `RuntimeInformation` to assemblies Unity does not ship; those requests are now served by Unity's own netstandard.dll
+- **JALib** — JALib reverse patches the original IL of `UpdateWrapper` to build its own patches. `UpdateWrapper` keeps its old body, whose detour call now goes to `Bridge.ReplaceMethod`, hosting JALib's method inside HarmonyX so MelonLoader patches still wrap it
+- **Rollback on failure** — a UMM patch that fails to build is taken back out of HarmonyX instead of breaking every later patch on that method
+- **Removed** — `ProxyPatch`, the `Harmony.Patch()` prefix, routing by runtime ownership, `TranspilerBridge`, and `UMMBridge.cfg` / `UMMBRIDGE_TRANSPILER_BRIDGE` / `UMMBRIDGE_VERBOSE` (there is only one runtime left to choose)
+- **Offline verification** — against real HarmonyX 2.10.2, 0Harmony 2.3.6 and the JALib 1.0.0.45 release: UMM, MelonLoader and JALib patches coexisting on one method, `UnpatchAll`, JALib unpatching, failure rollback, reverse patches
+- Includes every v1.2.1 fix (v1.2.1 was never released on its own)
+
 ## v1.2.1
 
 ### 中文
